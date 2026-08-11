@@ -23,6 +23,7 @@
     verifying: "正在验证",
     succeeded: "登录成功",
     failed: "登录未完成",
+    browser_closed: "登录会话已关闭",
     expired: "已超时",
     cancelled: "已取消",
     idle: "尚未开始",
@@ -72,6 +73,7 @@
   };
 
   const jobRenderSignatures = new WeakMap();
+  const sourceTabsVertical = window.matchMedia("(max-width: 760px)");
 
   const elements = {
     serverStatus: document.querySelector("#server-status"),
@@ -97,6 +99,7 @@
     manualLogin: document.querySelector("#manual-login"),
     logout: document.querySelector("#logout"),
     collectForm: document.querySelector("#collect-form"),
+    sourceTabs: document.querySelector(".source-tabs"),
     keywordPanel: document.querySelector("#keyword-panel"),
     userPanel: document.querySelector("#user-panel"),
     keyword: document.querySelector("#keyword"),
@@ -119,6 +122,7 @@
     exportBasic: document.querySelector("#export-basic"),
     toast: document.querySelector("#toast"),
     srStatus: document.querySelector("#sr-status"),
+    workflow: document.querySelector("#workflow"),
   };
 
   class ApiError extends Error {
@@ -238,7 +242,7 @@
       return "当前固定采集运行时不可用，请检查健康状态中的阻断项。";
     }
     if (error instanceof ApiError && error.code === "AUTH_EXPIRED") {
-      return "登录已失效，请重新导入官方网页 Cookie 后恢复任务。";
+      return "登录已过期。请重新扫码登录（或手动导入 Cookie）后恢复任务。";
     }
     if (error instanceof ApiError && error.code === "RATE_LIMITED") {
       return "平台暂时限制了请求。任务已安全暂停，请稍后恢复。";
@@ -308,6 +312,31 @@
     );
   }
 
+  function renderWorkflowState() {
+    if (!elements.workflow) return;
+    const connected = isAuthenticated(state.auth);
+    const hasJobs = state.jobs.length > 0;
+    const hasFinishedJob = state.jobs.some((job) =>
+      ["completed", "completed_with_warnings"].includes(job.status),
+    );
+    const current = !connected ? "connect" : !hasJobs ? "scope" : "export";
+    const complete = new Set();
+    if (connected) complete.add("connect");
+    if (hasJobs) complete.add("scope");
+    if (hasFinishedJob) complete.add("export");
+    elements.workflow.dataset.flowState = hasFinishedJob ? "complete" : current;
+    elements.workflow.querySelectorAll("[data-workflow-step]").forEach((step) => {
+      const name = step.dataset.workflowStep;
+      step.classList.toggle("is-current", name === current && !complete.has(name));
+      step.classList.toggle("is-complete", complete.has(name));
+      if (name === current && !complete.has(name)) {
+        step.setAttribute("aria-current", "step");
+      } else {
+        step.removeAttribute("aria-current");
+      }
+    });
+  }
+
   function renderAuth(auth) {
     state.auth = auth || {};
     const connected = isAuthenticated(state.auth);
@@ -359,6 +388,7 @@
     } else {
       setPill(elements.authBadge, "未登录", "warning");
     }
+    renderWorkflowState();
   }
 
   async function loadAuth({ quiet = false } = {}) {
@@ -379,7 +409,7 @@
     if (["starting", "awaiting_scan", "verifying"].includes(status)) return "running";
     if (status === "succeeded") return "success";
     if (status === "expired") return "warning";
-    if (status === "failed") return "danger";
+    if (["failed", "browser_closed"].includes(status)) return "danger";
     return "neutral";
   }
 
@@ -527,12 +557,24 @@
     const visible = status !== "idle";
     const terminalMessage = {
       failed: "登录未完成，请重新获取二维码",
+      browser_closed: "登录会话已关闭，请重新获取二维码",
       expired: "二维码已过期，请重新获取",
       cancelled: "扫码登录已取消",
       succeeded: "登录成功",
       idle: "点击获取登录二维码",
     };
-    if (["verifying", "succeeded", "failed", "expired", "cancelled", "idle"].includes(status) && status !== previousStatus) {
+    if (
+      [
+        "verifying",
+        "succeeded",
+        "failed",
+        "expired",
+        "cancelled",
+        "browser_closed",
+        "idle",
+      ].includes(status) &&
+      status !== previousStatus
+    ) {
       resetBrowserQr({
         message: terminalMessage[status] || "正在验证登录…",
         visualState: status,
@@ -547,7 +589,13 @@
     ) {
       resetBrowserQr({ message: "二维码已刷新，正在加载新二维码…", visualState: "loading" });
     }
-    elements.browserLoginProgress.hidden = !visible;
+    const terminalWithoutProgress = [
+      "cancelled",
+      "expired",
+      "browser_closed",
+      "failed",
+    ].includes(status);
+    elements.browserLoginProgress.hidden = !visible || terminalWithoutProgress;
     elements.cancelBrowserLogin.hidden = !active;
     setPill(
       elements.browserLoginStatus,
@@ -575,7 +623,7 @@
               : "正在加载二维码…"
             : status === "verifying"
               ? "正在验证…"
-              : ["failed", "expired", "cancelled"].includes(status)
+              : ["failed", "expired", "cancelled", "browser_closed"].includes(status)
                 ? "重新获取二维码"
                 : "获取登录二维码",
     );
@@ -1168,6 +1216,7 @@
     });
     elements.jobsEmpty.hidden = state.jobs.length > 0;
     elements.jobsList.hidden = state.jobs.length === 0;
+    renderWorkflowState();
   }
 
   function scheduleJobsRefresh() {
@@ -1274,10 +1323,22 @@
   }
 
   function bindEvents() {
+    function updateSourceTabsOrientation() {
+      elements.sourceTabs?.setAttribute(
+        "aria-orientation",
+        sourceTabsVertical.matches ? "vertical" : "horizontal",
+      );
+    }
+
+    updateSourceTabsOrientation();
+    sourceTabsVertical.addEventListener("change", updateSourceTabsOrientation);
     document.querySelectorAll("[data-source-tab]").forEach((tab) => {
       tab.addEventListener("click", () => setSourceType(tab.dataset.sourceTab));
       tab.addEventListener("keydown", (event) => {
-        if (!["ArrowLeft", "ArrowRight"].includes(event.key)) return;
+        const navigationKeys = sourceTabsVertical.matches
+          ? ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]
+          : ["ArrowLeft", "ArrowRight"];
+        if (!navigationKeys.includes(event.key)) return;
         event.preventDefault();
         const next = tab.dataset.sourceTab === "keyword" ? "user" : "keyword";
         setSourceType(next);

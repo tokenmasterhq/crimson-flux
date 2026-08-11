@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import webbrowser
 from dataclasses import replace
@@ -24,7 +25,7 @@ class SingleInstanceLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         handle = self.path.open("a+b")
         try:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
 
                 handle.seek(0, os.SEEK_END)
@@ -32,7 +33,7 @@ class SingleInstanceLock:
                     handle.write(b"0")
                     handle.flush()
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
 
@@ -47,13 +48,11 @@ class SingleInstanceLock:
         if self.handle is None:
             return
         try:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
 
                 self.handle.seek(0)
-                msvcrt.locking(  # type: ignore[attr-defined]
-                    self.handle.fileno(), msvcrt.LK_UNLCK, 1  # type: ignore[attr-defined]
-                )
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 import fcntl
 

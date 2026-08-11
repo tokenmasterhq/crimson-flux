@@ -299,6 +299,9 @@ def test_instance_atomic_replace_detects_changed_target(
         return created
 
     monkeypatch.setattr(security, "write_private_file", replace_target_during_write)
+    # Some filesystems can immediately reuse an inode after unlink.  Keep the
+    # regression deterministic by simulating that identity collision.
+    monkeypatch.setattr(security, "_same_file", lambda *_args: True)
 
     with pytest.raises(RuntimeError, match="替换前已变化"):
         _write_instance_file(instance_path, port=8765, local_token="local-test-token")

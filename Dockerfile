@@ -38,10 +38,10 @@ ENV PATH=/opt/crimsonflux/bin:/usr/local/bin:/usr/bin:/bin \
     CRIMSONFLUX_EXPORT_DIR=/app/exports
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates libstdc++6 \
+    && apt-get install --yes --no-install-recommends ca-certificates libstdc++6 passwd \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid "${APP_GID}" app \
-    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --home-dir /home/app app \
+    && /usr/sbin/groupadd --gid "${APP_GID}" app \
+    && /usr/sbin/useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home --home-dir /home/app app \
     && install --directory --owner=app --group=app /app /app/exports /var/lib/crimsonflux
 
 COPY --from=python-builder /opt/crimsonflux /opt/crimsonflux

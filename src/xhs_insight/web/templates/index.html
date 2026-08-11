@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#ffffff">
     <meta name="description" content="CrimsonFlux 本地公开笔记采集与导出工具">
     <title>CrimsonFlux</title>
     <link rel="stylesheet" href="{{ url_for('web_static', path='/styles.css') }}?v={{ asset_version }}">
@@ -93,7 +94,7 @@
           </span>
           <span class="brand-copy">
             <strong>CrimsonFlux</strong>
-            <small>本地公开笔记采集器</small>
+            <small>LOCAL-FIRST COLLECTOR</small>
           </span>
         </a>
         <div class="connection-group">
@@ -102,7 +103,7 @@
             <span>正在连接本地服务</span>
           </span>
           <button id="auth-action" class="button button-secondary button-small" type="button">
-            <svg class="icon" aria-hidden="true"><use href="#icon-shield"></use></svg>
+            <svg class="icon" aria-hidden="true"><use href="#icon-qr"></use></svg>
             <span>检查登录</span>
           </button>
         </div>
@@ -124,21 +125,21 @@
           </div>
         </div>
 
-        <aside class="workflow-card" aria-label="使用流程">
+        <aside id="workflow" class="workflow-card" aria-label="使用流程" data-flow-state="connect">
           <div class="workflow-card-heading">
             <span class="workflow-label">一次完成</span>
             <strong>3 步拿到标准数据</strong>
           </div>
           <ol class="workflow-list">
-            <li>
+            <li data-workflow-step="connect" class="is-current">
               <span>01</span>
               <div><strong>连接账号</strong><small>验证并加密保存登录态</small></div>
             </li>
-            <li>
+            <li data-workflow-step="scope">
               <span>02</span>
               <div><strong>设置范围</strong><small>关键词数量或用户公开笔记</small></div>
             </li>
-            <li>
+            <li data-workflow-step="export">
               <span>03</span>
               <div><strong>下载文件</strong><small>CSV · JSONL · manifest</small></div>
             </li>
@@ -445,8 +446,9 @@
 
           <div id="jobs-empty" class="empty-state">
             <span class="empty-icon" aria-hidden="true"><svg class="icon"><use href="#icon-inbox"></use></svg></span>
-            <strong>还没有采集任务</strong>
-            <p>完成上面的设置并开始采集，进度和下载文件会出现在这里。</p>
+            <span class="ready-label">READY</span>
+            <strong>等待第一项采集任务</strong>
+            <p>完成上面的设置并开始采集，进度与 CSV、JSONL、manifest 下载会出现在这里。</p>
           </div>
           <div id="jobs-list" class="jobs-list"></div>
         </section>

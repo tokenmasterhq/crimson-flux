@@ -225,7 +225,10 @@ def test_csv_jsonl_and_manifest_share_rows(tmp_path: Path) -> None:
     paths = Exporter(repository, tmp_path / "exports", collector_version="fixture-v1").export(job["id"])
     with Path(paths["csv"]).open(encoding="utf-8-sig", newline="") as handle:
         csv_rows = list(csv.DictReader(handle))
-    json_rows = [json.loads(line) for line in Path(paths["jsonl"]).read_text().splitlines()]
+    json_rows = [
+        json.loads(line)
+        for line in Path(paths["jsonl"]).read_text(encoding="utf-8").splitlines()
+    ]
     assert [row["note_id"] for row in csv_rows] == [row["note_id"] for row in json_rows]
     assert csv_rows[0]["title"].startswith("'")
     assert json_rows[0]["title"] == "=SUM(1,1)"
@@ -235,7 +238,7 @@ def test_csv_jsonl_and_manifest_share_rows(tmp_path: Path) -> None:
     assert json_rows[0]["updated_at"] is None
     combined = Path(paths["csv"]).read_bytes() + Path(paths["jsonl"]).read_bytes()
     assert b"xsec_token" not in combined
-    manifest = json.loads(Path(paths["manifest"]).read_text())
+    manifest = json.loads(Path(paths["manifest"]).read_text(encoding="utf-8"))
     assert manifest["collector_version"] == "fixture-v1"
     assert manifest["counts"]["exported_rows"] == 2
     for output in manifest["outputs"]:

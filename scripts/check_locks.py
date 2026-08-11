@@ -40,7 +40,9 @@ def main() -> int:
                 print(result.stderr, file=sys.stderr, end="")
             return result.returncode
         expected = ROOT / "requirements.lock"
-        if generated.read_bytes() != expected.read_bytes():
+        generated_bytes = generated.read_bytes().replace(b"\r\n", b"\n")
+        expected_bytes = expected.read_bytes().replace(b"\r\n", b"\n")
+        if generated_bytes != expected_bytes:
             print(
                 "requirements.lock is stale; regenerate it with: " + " ".join(command[:-1]) + " requirements.lock",
                 file=sys.stderr,

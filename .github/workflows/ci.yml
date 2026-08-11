@@ -33,6 +33,7 @@ jobs:
           version: "0.9.27"
           enable-cache: true
       - name: Check deployment skeleton and prerequisites
+        shell: bash
         run: |
           python scripts/check_skeleton.py
           python scripts/check_locks.py
@@ -46,6 +47,7 @@ jobs:
         run: |
           uv sync --frozen --extra dev
       - name: Test and lint
+        shell: bash
         run: |
           uv run pytest --cov=src/xhs_insight --cov-report=term-missing
           uv run ruff check src tests scripts

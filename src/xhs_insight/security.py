@@ -110,6 +110,22 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
     return os.path.samestat(left, right)
 
 
+def _same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare identity and mutable metadata captured by two path snapshots."""
+
+    return _same_file(left, right) and (
+        left.st_mode,
+        left.st_size,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_mode,
+        right.st_size,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
+
+
 def _unlink_if_same(path: Path, expected: os.stat_result | None) -> None:
     if expected is None:
         return
@@ -213,7 +229,9 @@ def replace_private_file(path: str | Path, payload: bytes) -> os.stat_result:
     try:
         current = _optional_regular_lstat(target)
         if (original is None) != (current is None) or (
-            original is not None and current is not None and not _same_file(original, current)
+            original is not None
+            and current is not None
+            and not _same_file_state(original, current)
         ):
             raise RuntimeError("本地凭证目标在替换前已变化")
         os.replace(temporary, target)
