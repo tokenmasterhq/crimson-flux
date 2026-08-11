@@ -33,7 +33,7 @@
     queued: "等待运行",
     enumerating: "正在列出笔记",
     awaiting_detail_confirmation: "等待详情确认",
-    fetching_details: "正在采集详情",
+    fetching_details: "正在补全详情",
     exporting: "正在生成文件",
     completed: "已完成",
     completed_with_warnings: "已完成，有缺失",
@@ -239,7 +239,7 @@
 
   function humanError(error) {
     if (error instanceof ApiError && error.code === "UPSTREAM_UNSUPPORTED") {
-      return "当前固定采集运行时不可用，请检查健康状态中的阻断项。";
+      return "当前内容处理组件不可用，请检查健康状态中的阻断项。";
     }
     if (error instanceof ApiError && error.code === "AUTH_EXPIRED") {
       return "登录已过期。请重新扫码登录（或手动导入 Cookie）后恢复任务。";
@@ -252,7 +252,7 @@
 
   function setServerAvailable(available) {
     if (available && state.health?.status === "degraded") {
-      setPill(elements.serverStatus, "采集运行时未就绪", "warning");
+      setPill(elements.serverStatus, "处理组件未就绪", "warning");
       return;
     }
     setPill(
@@ -372,8 +372,8 @@
       elements.createJob,
       connected
         ? collectionReady
-          ? "开始采集"
-          : "采集运行时未就绪"
+          ? "开始整理"
+          : "处理组件未就绪"
         : "请先完成登录",
     );
     if (connected) {
@@ -529,7 +529,7 @@
       elements.browserLoginPlaceholder.hidden = true;
       elements.browserLoginVisual.dataset.state = "ready";
       setButtonLabel(elements.browserLogin, "等待扫码确认");
-      elements.srStatus.textContent = "登录二维码已显示，请使用小红书 App 扫描。";
+      elements.srStatus.textContent = "登录二维码已显示，请使用平台官方 App 扫描。";
     } catch (error) {
       if (candidateObjectUrl) URL.revokeObjectURL(candidateObjectUrl);
       if (generation !== state.browserQrGeneration) return;
@@ -605,7 +605,7 @@
     elements.browserLoginMessage.textContent =
       state.browserLogin.message ||
       (status === "awaiting_scan"
-        ? "请使用小红书 App 扫描二维码，并在手机上确认。"
+        ? "请使用平台官方 App 扫描二维码，并在手机上确认。"
         : terminalMessage[status] || "正在准备登录二维码…");
     updateBrowserLoginCountdown(status, state.browserLogin);
     if (status !== previousStatus) {
@@ -824,7 +824,7 @@
     const small = elements.estimate.querySelector("small");
     if (state.sourceType === "user") {
       strong.textContent = withDetails
-        ? "耗时取决于公开笔记数量；列出后会再次确认详情采集"
+        ? "耗时取决于公开内容数量；列出后会再次确认详情补全"
         : "耗时取决于该用户当前可见的公开笔记数量";
       small.textContent = withDetails
         ? `届时会显示数量和新估算；确认前不请求详情。当前请求间隔 ${state.limits.pauseMinSeconds}–${state.limits.pauseMaxSeconds} 秒。`
@@ -1145,7 +1145,7 @@
 
     const actions = element("div", "job-actions");
     if (job.status === "awaiting_detail_confirmation") {
-      actions.append(actionButton("确认详情采集", "confirm", job.id, "primary"));
+      actions.append(actionButton("确认补全详情", "confirm", job.id, "primary"));
     }
     if (ACTIVE_STATUSES.has(job.status) || job.status === "awaiting_detail_confirmation") {
       actions.append(actionButton("取消", "cancel", job.id, "secondary"));
@@ -1288,7 +1288,7 @@
     event?.preventDefault();
     const job = state.confirmJob;
     if (!job) return;
-    await submitDetailDecision(job.content, "已确认，任务将继续采集详情。");
+    await submitDetailDecision(job.content, "已确认，任务将继续补全详情。");
   }
 
   async function exportBasic(event) {
@@ -1306,7 +1306,7 @@
       openDetailConfirmation(job);
       return;
     }
-    if (action === "cancel" && !window.confirm("确定取消这个任务吗？已采集的数据不会被删除。")) {
+    if (action === "cancel" && !window.confirm("确定取消这个任务吗？已整理的数据不会被删除。")) {
       return;
     }
     button.disabled = true;

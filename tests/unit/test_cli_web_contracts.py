@@ -432,10 +432,10 @@ def test_web_contract_has_no_runtime_demo_mode_and_keeps_export_controls() -> No
     assert 'type="password"' in template
     assert 'autocomplete="new-password"' in template
     assert 'id="browser-login"' in template
-    assert "扫码登录小红书" in template
+    assert "扫码连接平台账号" in template
     assert "打开一个全新的小红书官方浏览器窗口" not in template
     assert 'id="browser-login-qr"' in template
-    assert 'alt="小红书登录二维码，请使用小红书 App 扫描"' in template
+    assert 'alt="平台登录二维码，请使用平台官方 App 扫描"' in template
     assert 'id="browser-login-countdown"' in template
     assert 'aria-live="polite"' in template
     assert "二维码在本页完成，不读取日常浏览器资料" in template
@@ -450,6 +450,14 @@ def test_web_contract_has_no_runtime_demo_mode_and_keeps_export_controls() -> No
     assert "最多发起 ${count} 次详情请求" in script
     assert "fixtureMode" not in script
     assert "离线演示" not in script
+    assert "小红书" not in template
+    assert "小红书" not in script
+    assert "采集" not in template
+    assert "采集" not in script
+    assert "只按回车" in template
+    assert '<span class="hero-product-cn">绯流</span>' in template
+    assert '<span class="hero-product-en">CrimsonFlux</span>' in template
+    assert "brand-just-enter.svg" in template
     assert 'api("/auth/import"' in script
     assert 'api("/auth/browser"' in script
     assert 'api("/auth/browser/status")' in script

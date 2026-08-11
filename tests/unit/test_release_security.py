@@ -36,6 +36,7 @@ def test_repository_release_projection_is_independent_and_clean() -> None:
     selected = [path.relative_to(ROOT).as_posix() for path in source_file_paths(ROOT)]
 
     assert selected
+    assert "src/xhs_insight/web/static/brand-just-enter.svg" in selected
     assert all(_RETIRED_ROOT not in PurePosixPath(path).parts for path in selected)
     assert all("node_modules" not in PurePosixPath(path).parts for path in selected)
     assert scan_source(ROOT) == []
@@ -47,6 +48,7 @@ def test_repository_release_projection_is_independent_and_clean() -> None:
         "README.md",
         "Dockerfile",
         "src/xhs_insight/app.py",
+        "src/xhs_insight/web/static/brand-just-enter.svg",
         "scripts/start.py",
         "tests/unit/test_example.py",
         "exports/.gitkeep",
