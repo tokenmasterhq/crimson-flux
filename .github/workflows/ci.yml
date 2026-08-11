@@ -66,6 +66,8 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: CLI contract smoke
+        env:
+          PYTHONUTF8: "1"
         run: uv run crimsonflux --help
 
   compose-smoke:
