@@ -38,6 +38,9 @@ _DIRECTORY_SUFFIXES = {
     "src": frozenset({".css", ".html", ".js", ".json", ".py"}),
     "tests": frozenset({".json", ".py"}),
 }
+_EXACT_RELEASE_PATHS = frozenset(
+    {"src/xhs_insight/web/static/brand-just-enter.svg"}
+)
 _RETIRED_ROOT = "third" + "_party"
 _FORBIDDEN_PARTS = frozenset(
     {
@@ -157,6 +160,8 @@ def release_path_allowed(relative: str | Path | PurePosixPath) -> bool:
         return False
     if is_sensitive_path(path):
         return False
+    if path.as_posix() in _EXACT_RELEASE_PATHS:
+        return True
     if len(path.parts) == 1:
         return path.as_posix() in ROOT_RELEASE_FILES
     if path.parts[0] == "exports":

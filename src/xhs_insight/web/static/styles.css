@@ -197,12 +197,20 @@ code {
   height: 23px;
 }
 
+.brand-logo-image {
+  display: block;
+  width: 30px;
+  height: 30px;
+}
+
 .brand-copy strong,
 .brand-copy small {
   display: block;
 }
 
 .brand-copy strong {
+  font-family: "Yuanti SC", "STYuanti-SC-Bold", "Microsoft YaHei UI",
+    "PingFang SC", ui-rounded, system-ui, sans-serif;
   font-size: 15px;
   font-weight: 720;
   letter-spacing: -0.015em;
@@ -231,11 +239,11 @@ code {
 
 .hero {
   display: grid;
-  grid-template-columns: minmax(0, 1.18fr) minmax(340px, 0.82fr);
-  gap: clamp(38px, 7vw, 86px);
+  grid-template-columns: minmax(0, 1.12fr) minmax(390px, 0.88fr);
+  gap: clamp(44px, 6vw, 74px);
   align-items: center;
-  margin-bottom: 64px;
-  padding: 8px 8px 4px;
+  margin-bottom: 68px;
+  padding: 12px 8px 6px;
 }
 
 .eyebrow,
@@ -249,71 +257,114 @@ code {
 
 .eyebrow {
   display: inline-flex;
-  gap: 8px;
+  gap: 9px;
   align-items: center;
-  margin-bottom: 16px;
-}
-
-.eyebrow > span {
-  width: 7px;
-  height: 7px;
+  min-height: 34px;
+  margin-bottom: 22px;
+  padding: 8px 13px 8px 11px;
   border-radius: 999px;
   background: var(--accent);
-  box-shadow: 0 0 0 5px rgb(255 36 66 / 10%);
+  box-shadow:
+    0 0 0 1px rgb(255 36 66 / 8%),
+    0 10px 24px -16px rgb(255 36 66 / 68%);
+  color: #fff;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+}
+
+.lab-glow {
+  position: relative;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: 0 0 0 4px rgb(255 255 255 / 18%), 0 0 12px rgb(255 255 255 / 90%);
 }
 
 .hero h1 {
-  max-width: 700px;
-  margin-bottom: 20px;
-  font-size: clamp(48px, 6.3vw, 76px);
-  font-weight: 740;
-  letter-spacing: -0.06em;
-  line-height: 0.98;
+  display: flex;
+  max-width: none;
+  gap: clamp(10px, 1.4vw, 18px);
+  align-items: baseline;
+  margin-bottom: 22px;
+  font-family: ui-rounded, "SF Pro Rounded", "Avenir Next Rounded",
+    "Arial Rounded MT Bold", "PingFang SC", "Microsoft YaHei UI", system-ui,
+    sans-serif;
+  font-size: clamp(46px, 5.4vw, 68px);
+  font-weight: 720;
+  letter-spacing: -0.045em;
+  line-height: 1.06;
+  text-wrap: nowrap;
+  white-space: nowrap;
 }
 
-.hero h1 span {
+.hero-product-cn {
   color: var(--ink);
+  font-family: "Yuanti SC", "STYuanti-SC-Bold", "Microsoft YaHei UI",
+    "PingFang SC", ui-rounded, system-ui, sans-serif;
+  font-weight: 700;
+  letter-spacing: -0.055em;
+}
+
+.hero-product-en {
+  color: var(--accent);
+  font-size: 0.78em;
+  font-weight: 690;
+  letter-spacing: -0.035em;
 }
 
 .hero-copy {
-  max-width: 680px;
-  margin-bottom: 23px;
+  max-width: 700px;
+  margin-bottom: 26px;
   color: var(--ink-soft);
-  font-size: 16px;
-  line-height: 1.8;
+  font-size: 15px;
+  line-height: 1.72;
 }
 
 .hero-trust {
   display: flex;
   flex-wrap: wrap;
-  gap: 9px;
+  gap: 10px;
 }
 
 .hero-trust span {
   display: inline-flex;
-  gap: 7px;
+  gap: 6px;
   align-items: center;
-  min-height: 34px;
-  padding: 7px 11px;
+  min-height: 36px;
+  padding: 8px 12px;
   border-radius: 999px;
-  background: var(--surface-subtle);
-  box-shadow: none;
-  color: var(--ink-soft);
+  background: #fff;
+  box-shadow: 0 0 0 1px #e5e1dc;
+  color: #4e4a46;
   font-size: 12px;
   font-weight: 620;
 }
 
-.hero-trust .icon {
-  color: var(--accent);
+.hero-trust span.is-accent {
+  background: #fffafa;
+  box-shadow: 0 0 0 1px rgb(255 36 66 / 28%);
+}
+
+.hero-trust .trust-glyph {
+  display: inline;
+  min-height: 0;
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+  font-size: 14px;
+  line-height: 1;
 }
 
 .workflow-card {
   position: relative;
   overflow: hidden;
-  padding: 28px;
-  border-radius: 28px;
-  background: var(--surface-subtle);
-  box-shadow: none;
+  padding: 30px;
+  border-radius: 30px;
+  background: linear-gradient(145deg, #fdfbf7 0%, #f8f4ed 100%);
+  box-shadow:
+    0 0 0 1px rgb(25 21 18 / 4%),
+    0 22px 50px -34px rgb(40 30 22 / 26%);
 }
 
 .workflow-card::after {
@@ -327,21 +378,23 @@ code {
   gap: 14px;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 20px;
+  margin-bottom: 28px;
 }
 
 .workflow-card-heading strong {
-  font-size: 15px;
-  letter-spacing: -0.015em;
+  font-size: 16px;
+  letter-spacing: -0.025em;
 }
 
 .workflow-label {
-  padding: 5px 8px;
+  padding: 6px 9px;
   border-radius: 999px;
-  background: var(--accent-soft);
+  background: #fff;
+  box-shadow: 0 0 0 1px rgb(255 36 66 / 16%);
   color: var(--accent-strong);
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 760;
+  letter-spacing: 0.08em;
 }
 
 .workflow-list {
@@ -356,22 +409,26 @@ code {
 
 .workflow-list::before {
   position: absolute;
-  top: 20px;
-  right: calc(16.666% + 18px);
+  top: 26px;
+  right: calc(16.666% + 23px);
   bottom: auto;
-  left: calc(16.666% + 18px);
+  left: calc(16.666% + 23px);
   width: auto;
   height: 1px;
-  background: rgb(255 36 66 / 18%);
+  background: repeating-linear-gradient(
+    90deg,
+    rgb(255 36 66 / 38%) 0 4px,
+    transparent 4px 9px
+  );
   content: "";
 }
 
 .workflow-list li {
   position: relative;
   display: flex;
-  min-height: 106px;
+  min-height: 118px;
   flex-direction: column;
-  gap: 11px;
+  gap: 14px;
   align-items: center;
   padding: 0 7px;
   text-align: center;
@@ -380,27 +437,36 @@ code {
 .workflow-list li > span {
   z-index: 1;
   display: grid;
-  width: 40px;
-  height: 40px;
+  width: 52px;
+  height: 52px;
   flex: 0 0 auto;
   place-items: center;
   border-radius: 999px;
   background: #fff;
-  box-shadow: 0 0 0 1px #e7e1da, 0 0 0 6px var(--surface-subtle);
-  color: var(--ink-soft);
-  font-size: 10px;
+  box-shadow:
+    0 0 0 1px rgb(255 36 66 / 20%),
+    0 0 0 7px #faf7f1,
+    0 8px 18px -12px rgb(255 36 66 / 45%);
+  color: var(--accent-text);
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
   font-weight: 800;
 }
 
 .workflow-list li.is-current > span {
-  box-shadow: 0 0 0 1px rgb(255 36 66 / 42%), 0 0 0 6px var(--surface-subtle);
+  box-shadow:
+    0 0 0 1px var(--accent),
+    0 0 0 7px #faf7f1,
+    0 10px 24px -12px rgb(255 36 66 / 62%);
   color: var(--accent-text);
 }
 
 .workflow-list li.is-complete > span {
   background: var(--accent-soft);
-  box-shadow: 0 0 0 1px rgb(255 36 66 / 42%), 0 0 0 6px var(--surface-subtle);
+  box-shadow:
+    0 0 0 1px rgb(255 36 66 / 42%),
+    0 0 0 7px #faf7f1,
+    0 10px 24px -14px rgb(255 36 66 / 46%);
   color: var(--accent-text);
 }
 
@@ -410,23 +476,25 @@ code {
 }
 
 .workflow-list strong {
-  font-size: 13px;
+  font-size: 14px;
 }
 
 .workflow-list small {
-  margin-top: 4px;
+  margin-top: 5px;
   color: var(--ink-soft);
   font-size: 11px;
+  line-height: 1.45;
 }
 
 .workflow-output {
   display: flex;
   gap: 10px;
   align-items: center;
-  margin-top: 2px;
-  padding: 13px;
-  border-radius: 15px;
-  background: #fff;
+  margin-top: 8px;
+  padding: 16px 4px 0;
+  border-top: 1px solid rgb(36 30 25 / 8%);
+  border-radius: 0;
+  background: transparent;
   color: var(--ink);
 }
 
@@ -2204,12 +2272,12 @@ input[type="number"],
 
 @media (max-width: 900px) {
   .hero {
-    grid-template-columns: minmax(0, 1fr) minmax(300px, 0.78fr);
+    grid-template-columns: minmax(0, 1fr) minmax(320px, 0.78fr);
     gap: 32px;
   }
 
   .hero h1 {
-    font-size: clamp(42px, 7vw, 58px);
+    font-size: clamp(40px, 6.4vw, 54px);
   }
 
   .auth-layout {
@@ -2290,14 +2358,14 @@ input[type="number"],
 
   .hero {
     grid-template-columns: 1fr;
-    gap: 22px;
-    margin-bottom: 26px;
+    gap: 28px;
+    margin-bottom: 30px;
     padding: 0 2px;
   }
 
   .hero h1 {
     margin-bottom: 16px;
-    font-size: clamp(39px, 12vw, 52px);
+    font-size: clamp(40px, 10.5vw, 52px);
   }
 
   .hero-copy {
@@ -2308,7 +2376,7 @@ input[type="number"],
 
   .workflow-card {
     display: block;
-    padding: 20px;
+    padding: 23px;
   }
 
   .workflow-list {
@@ -2318,13 +2386,13 @@ input[type="number"],
 
   .workflow-list::before {
     display: block;
-    top: 15px;
-    right: calc(16.666% + 15px);
-    left: calc(16.666% + 15px);
+    top: 21px;
+    right: calc(16.666% + 20px);
+    left: calc(16.666% + 20px);
   }
 
   .workflow-list li {
-    min-height: 72px;
+    min-height: 84px;
     flex-direction: column;
     gap: 8px;
     align-items: center;
@@ -2335,8 +2403,8 @@ input[type="number"],
   }
 
   .workflow-list li > span {
-    width: 30px;
-    height: 30px;
+    width: 42px;
+    height: 42px;
     border-radius: 999px;
   }
 
@@ -2497,16 +2565,17 @@ input[type="number"],
   }
 
   .hero h1 {
-    font-size: clamp(37px, 13vw, 48px);
+    font-size: clamp(37px, 11.5vw, 46px);
   }
 
   .hero-trust {
-    display: grid;
-    grid-template-columns: 1fr;
+    display: flex;
+    gap: 8px;
   }
 
   .hero-trust span {
     justify-content: center;
+    font-size: 11px;
   }
 
   .workflow-card-heading strong {
