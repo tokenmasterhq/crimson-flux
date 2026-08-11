@@ -1,0 +1,42 @@
+name: crimsonflux
+
+services:
+  app:
+    image: crimsonflux:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: "${CRIMSONFLUX_CONTAINER_UID:-1000}"
+        APP_GID: "${CRIMSONFLUX_CONTAINER_GID:-1000}"
+    init: true
+    environment:
+      CRIMSONFLUX_HOST: 0.0.0.0
+      CRIMSONFLUX_ALLOW_CONTAINER_BIND: "1"
+      CRIMSONFLUX_PORT: 8765
+      CRIMSONFLUX_NO_BROWSER: "1"
+      CRIMSONFLUX_STATE_DIR: /var/lib/crimsonflux
+      CRIMSONFLUX_EXPORT_DIR: /app/exports
+      CRIMSONFLUX_MAX_KEYWORD_ITEMS: "${CRIMSONFLUX_MAX_KEYWORD_ITEMS:-1000}"
+      CRIMSONFLUX_MAX_USER_ITEMS: "${CRIMSONFLUX_MAX_USER_ITEMS:-10000}"
+      CRIMSONFLUX_REQUEST_PAUSE_MIN: "${CRIMSONFLUX_REQUEST_PAUSE_MIN:-2}"
+      CRIMSONFLUX_REQUEST_PAUSE_MAX: "${CRIMSONFLUX_REQUEST_PAUSE_MAX:-4}"
+    ports:
+      - "127.0.0.1:${CRIMSONFLUX_PORT:-8765}:8765"
+    volumes:
+      - crimsonflux_state:/var/lib/crimsonflux
+      - ./exports:/app/exports
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 20s
+    restart: "no"
+
+volumes:
+  crimsonflux_state:
+    name: crimsonflux_state

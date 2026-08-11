@@ -1,0 +1,120 @@
+name: source-ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly dependency/build drift check; push and PR runs remain the daily path.
+    - cron: "17 18 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-test:
+    name: source / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.27"
+          enable-cache: true
+      - name: Check deployment skeleton and prerequisites
+        run: |
+          python scripts/check_skeleton.py
+          python scripts/check_locks.py
+          python scripts/doctor.py
+          python scripts/scan_release.py --source .
+          python scripts/archive_source.py
+          python scripts/scan_release.py --archive dist/source
+      - name: Exercise native locked bootstrap
+        run: python scripts/start.py --prepare-only
+      - name: Add locked developer tools
+        run: |
+          uv sync --frozen --extra dev
+      - name: Test and lint
+        run: |
+          uv run pytest --cov=src/xhs_insight --cov-report=term-missing
+          uv run ruff check src tests scripts
+          uv run mypy src
+      - name: Produce native G1 evidence
+        shell: bash
+        run: |
+          mkdir -p dist/g1
+          uv run python scripts/verify_g1.py \
+            --output "dist/g1/g1-native-${{ runner.os }}-${{ runner.arch }}.json"
+      - name: Upload native G1 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: g1-native-${{ runner.os }}-${{ runner.arch }}
+          path: dist/g1/*.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: CLI contract smoke
+        run: uv run crimsonflux --help
+
+  compose-smoke:
+    name: local Docker Compose
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.27"
+          enable-cache: true
+      - name: Install locked security test environment
+        run: |
+          python scripts/start.py --prepare-only
+          uv sync --frozen --extra dev
+      - name: Validate Compose model
+        run: docker compose config --quiet
+      - name: Build locally from source
+        run: docker compose build --pull
+      - name: Produce built-container G1 evidence
+        shell: bash
+        run: |
+          mkdir -p dist/g1
+          uv run python scripts/verify_g1.py \
+            --container-image crimsonflux:local \
+            --output dist/g1/g1-container-Linux-X64.json
+      - name: Upload built-container G1 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: g1-container-Linux-X64
+          path: dist/g1/*.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Start live-only service (collector may report degraded before login)
+        run: docker compose up --detach --wait --wait-timeout 90
+      - name: Confirm loopback-only host publication
+        shell: bash
+        run: |
+          mapping="$(docker compose port app 8765)"
+          case "$mapping" in
+            127.0.0.1:*) ;;
+            *) echo "unexpected port mapping: $mapping" >&2; exit 1 ;;
+          esac
+      - name: Container CLI contract smoke
+        run: docker compose exec app crimsonflux --help
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop containers
+        if: always()
+        run: docker compose down --volumes --remove-orphans

@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="CrimsonFlux 本地公开笔记采集与导出工具">
+    <title>CrimsonFlux</title>
+    <link rel="stylesheet" href="{{ url_for('web_static', path='/styles.css') }}?v={{ asset_version }}">
+    <script src="{{ url_for('web_static', path='/app.js') }}?v={{ asset_version }}" defer></script>
+  </head>
+  <body data-api-base="{{ api_base }}">
+    <svg class="icon-sprite" aria-hidden="true">
+      <symbol id="icon-logo" viewBox="0 0 24 24">
+        <path d="M7.5 4.5h9a3 3 0 0 1 3 3v9a3 3 0 0 1-3 3h-9a3 3 0 0 1-3-3v-9a3 3 0 0 1 3-3Z"/>
+        <path d="m8 14 2.7-4 2.3 3 1.7-2.2L17 14H8Z"/>
+      </symbol>
+      <symbol id="icon-shield" viewBox="0 0 24 24">
+        <path d="M12 3 19 6v5c0 4.7-2.7 8-7 10-4.3-2-7-5.3-7-10V6l7-3Z"/>
+        <path d="m9 12 2 2 4-4"/>
+      </symbol>
+      <symbol id="icon-lock" viewBox="0 0 24 24">
+        <rect x="5" y="10" width="14" height="10" rx="2"/>
+        <path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v2"/>
+      </symbol>
+      <symbol id="icon-search" viewBox="0 0 24 24">
+        <circle cx="10.5" cy="10.5" r="6.5"/>
+        <path d="m15.5 15.5 4 4"/>
+      </symbol>
+      <symbol id="icon-user" viewBox="0 0 24 24">
+        <circle cx="12" cy="8" r="4"/>
+        <path d="M5 20c.8-4 3.1-6 7-6s6.2 2 7 6"/>
+      </symbol>
+      <symbol id="icon-file" viewBox="0 0 24 24">
+        <path d="M7 3h7l4 4v14H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"/>
+        <path d="M14 3v5h4M9 13h6M9 17h4"/>
+      </symbol>
+      <symbol id="icon-clock" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9"/>
+        <path d="M12 7v5l3 2"/>
+      </symbol>
+      <symbol id="icon-download" viewBox="0 0 24 24">
+        <path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14"/>
+      </symbol>
+      <symbol id="icon-refresh" viewBox="0 0 24 24">
+        <path d="M20 7v5h-5M4 17v-5h5"/>
+        <path d="M6.1 8A7 7 0 0 1 18.5 6L20 8M4 16l1.5 2A7 7 0 0 0 18 16"/>
+      </symbol>
+      <symbol id="icon-trash" viewBox="0 0 24 24">
+        <path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 11v6M14 11v6"/>
+      </symbol>
+      <symbol id="icon-arrow" viewBox="0 0 24 24">
+        <path d="M5 12h14m-5-5 5 5-5 5"/>
+      </symbol>
+      <symbol id="icon-check" viewBox="0 0 24 24">
+        <path d="m5 12 4 4L19 6"/>
+      </symbol>
+      <symbol id="icon-chevron" viewBox="0 0 24 24">
+        <path d="m8 10 4 4 4-4"/>
+      </symbol>
+      <symbol id="icon-inbox" viewBox="0 0 24 24">
+        <path d="M4 5h16l2 9v5H2v-5l2-9Z"/>
+        <path d="M2 14h5l2 3h6l2-3h5"/>
+      </symbol>
+      <symbol id="icon-alert" viewBox="0 0 24 24">
+        <path d="M12 3 2.5 20h19L12 3Z"/>
+        <path d="M12 9v5m0 3h.01"/>
+      </symbol>
+      <symbol id="icon-close" viewBox="0 0 24 24">
+        <path d="m7 7 10 10M17 7 7 17"/>
+      </symbol>
+      <symbol id="icon-play" viewBox="0 0 24 24">
+        <path d="m9 6 9 6-9 6V6Z"/>
+      </symbol>
+      <symbol id="icon-qr" viewBox="0 0 24 24">
+        <rect x="3.5" y="3.5" width="6" height="6" rx="1"/>
+        <rect x="14.5" y="3.5" width="6" height="6" rx="1"/>
+        <rect x="3.5" y="14.5" width="6" height="6" rx="1"/>
+        <path d="M14.5 14.5h2.5v2.5h-2.5zM18 14.5h2.5V18H18zM14.5 18h3v2.5h-3zM19 19h1.5v1.5H19z"/>
+      </symbol>
+      <symbol id="icon-pause" viewBox="0 0 24 24">
+        <path d="M9 6v12M15 6v12"/>
+      </symbol>
+    </svg>
+
+    <a class="skip-link" href="#main">跳到主要内容</a>
+
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="CrimsonFlux 首页">
+          <span class="brand-mark" aria-hidden="true">
+            <svg class="icon icon-brand"><use href="#icon-logo"></use></svg>
+          </span>
+          <span class="brand-copy">
+            <strong>CrimsonFlux</strong>
+            <small>本地公开笔记采集器</small>
+          </span>
+        </a>
+        <div class="connection-group">
+          <span id="server-status" class="status-pill status-checking">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span>正在连接本地服务</span>
+          </span>
+          <button id="auth-action" class="button button-secondary button-small" type="button">
+            <svg class="icon" aria-hidden="true"><use href="#icon-shield"></use></svg>
+            <span>检查登录</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main id="main" class="page-shell">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-content">
+          <p class="eyebrow"><span aria-hidden="true"></span> Local-first collector</p>
+          <h1 id="hero-title">本地采集，<br><span>清晰导出。</span></h1>
+          <p class="hero-copy">
+            输入关键词，或指定一个用户主页。CrimsonFlux 会把当前账号可见的公开笔记，
+            整理为结构清晰、可以继续使用的数据文件。
+          </p>
+          <div class="hero-trust" aria-label="产品边界">
+            <span><svg class="icon" aria-hidden="true"><use href="#icon-lock"></use></svg>登录态仅保存在本机</span>
+            <span><svg class="icon" aria-hidden="true"><use href="#icon-shield"></use></svg>仅采集公开内容</span>
+          </div>
+        </div>
+
+        <aside class="workflow-card" aria-label="使用流程">
+          <div class="workflow-card-heading">
+            <span class="workflow-label">一次完成</span>
+            <strong>3 步拿到标准数据</strong>
+          </div>
+          <ol class="workflow-list">
+            <li>
+              <span>01</span>
+              <div><strong>连接账号</strong><small>验证并加密保存登录态</small></div>
+            </li>
+            <li>
+              <span>02</span>
+              <div><strong>设置范围</strong><small>关键词数量或用户公开笔记</small></div>
+            </li>
+            <li>
+              <span>03</span>
+              <div><strong>下载文件</strong><small>CSV · JSONL · manifest</small></div>
+            </li>
+          </ol>
+          <div class="workflow-output">
+            <svg class="icon" aria-hidden="true"><use href="#icon-file"></use></svg>
+            <span><strong>标准化导出</strong><small>保留质量与完成度说明</small></span>
+          </div>
+        </aside>
+      </section>
+
+      <div class="workspace-stack">
+        <section id="auth-card" class="panel auth-panel" aria-labelledby="auth-title">
+          <div class="panel-heading">
+            <div class="panel-title-group">
+              <span class="step-number" aria-hidden="true">01</span>
+              <div>
+                <p class="section-kicker">账号连接</p>
+                <h2 id="auth-title">先连接你的小红书账号</h2>
+                <p class="section-description">只用于访问这个账号本来就能看到的公开内容。</p>
+              </div>
+            </div>
+            <span id="auth-badge" class="status-pill status-neutral">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span>尚未检查</span>
+            </span>
+          </div>
+
+          <div id="auth-logged-out" class="auth-content">
+            <div class="browser-login-layout">
+              <div class="browser-login-primary">
+                <div id="browser-login-visual" class="browser-login-visual" data-state="idle">
+                  <div class="qr-code-frame">
+                    <img id="browser-login-qr"
+                         class="browser-login-qr"
+                         alt="小红书登录二维码，请使用小红书 App 扫描"
+                         width="220" height="220" hidden>
+                    <div id="browser-login-placeholder" class="browser-login-placeholder">
+                      <span class="qr-placeholder-icon" aria-hidden="true">
+                        <svg class="icon"><use href="#icon-qr"></use></svg>
+                      </span>
+                      <span id="browser-login-placeholder-text">点击获取登录二维码</span>
+                    </div>
+                  </div>
+                  <span class="secure-orbit" aria-hidden="true"><svg class="icon"><use href="#icon-shield"></use></svg></span>
+                </div>
+                <div class="browser-login-copy">
+                  <p class="section-kicker">推荐方式</p>
+                  <h3>扫码登录小红书</h3>
+                  <p>登录二维码会直接显示在这里。打开小红书 App 扫一扫，确认后页面会自动完成登录。</p>
+                  <button id="browser-login" class="button button-primary button-large" type="button">
+                    <svg class="icon" aria-hidden="true"><use href="#icon-qr"></use></svg>
+                    <span>获取登录二维码</span>
+                  </button>
+                  <small id="browser-login-capability" class="muted">正在检查扫码能力…</small>
+                </div>
+              </div>
+
+              <div id="browser-login-progress" class="browser-login-progress" hidden>
+                <div>
+                  <span id="browser-login-status" class="status-pill status-running">
+                    <span class="status-dot" aria-hidden="true"></span>
+                    <span>正在生成</span>
+                  </span>
+                  <p id="browser-login-message" role="status" aria-live="polite" aria-atomic="true">正在生成登录二维码…</p>
+                  <span id="browser-login-countdown" class="browser-login-countdown" aria-hidden="true" hidden></span>
+                </div>
+                <button id="cancel-browser-login" class="button button-secondary button-small" type="button">取消</button>
+              </div>
+
+              <div class="browser-security-boundary">
+                <svg class="icon" aria-hidden="true"><use href="#icon-lock"></use></svg>
+                <p><strong>二维码在本页完成，不读取日常浏览器资料</strong><span>登录成功后，本地服务只保存采集必需的白名单 Cookie，并在账号验证通过后加密落盘。</span></p>
+              </div>
+
+              <details id="manual-login" class="manual-login-disclosure">
+                <summary>
+                  <span><strong>扫码不可用？手动导入 Cookie</strong><small>Docker 与无图形界面环境使用此方式</small></span>
+                  <svg class="icon" aria-hidden="true"><use href="#icon-chevron"></use></svg>
+                </summary>
+                <div class="manual-login-content">
+                  <form id="login-form" class="auth-import-form" autocomplete="off">
+                    <label class="field">
+                      <span>官方网页登录态 Cookie</span>
+                      <span class="secret-input-shell">
+                        <svg class="icon" aria-hidden="true"><use href="#icon-lock"></use></svg>
+                        <input id="cookie-input" name="xhs_login_secret" class="secret-input"
+                               type="password" maxlength="16384" autocomplete="new-password"
+                               autocapitalize="off" spellcheck="false" aria-describedby="cookie-help"
+                               placeholder="粘贴完整 Cookie" required>
+                      </span>
+                    </label>
+                    <p id="cookie-help" class="privacy-hint">
+                      <svg class="icon" aria-hidden="true"><use href="#icon-shield"></use></svg>
+                      不进入日志、导出、命令行参数或环境变量。
+                    </p>
+                    <button id="import-login" class="button button-secondary button-wide" type="submit">
+                      <span>验证并加密保存</span>
+                      <svg class="icon icon-directional" aria-hidden="true"><use href="#icon-arrow"></use></svg>
+                    </button>
+                    <small class="muted">不要通过截图、聊天或公开 issue 发送 Cookie。</small>
+                  </form>
+
+                  <div class="auth-guide">
+                    <div class="guide-heading">
+                      <span class="guide-icon" aria-hidden="true">
+                        <svg class="icon"><use href="#icon-shield"></use></svg>
+                      </span>
+                      <div>
+                        <strong>只从官方网页复制</strong>
+                        <p>应用仍会先验证账号，再把凭证加密保存在这台设备上。</p>
+                      </div>
+                    </div>
+                    <details class="help-disclosure">
+                      <summary>
+                        <span>查看 3 步复制方法</span>
+                        <svg class="icon" aria-hidden="true"><use href="#icon-chevron"></use></svg>
+                      </summary>
+                      <ol>
+                        <li>先在小红书官方网页完成登录。</li>
+                        <li>打开开发者工具的 Network，找到发往 <code>edith.xiaohongshu.com/api/sns/web/v2/user/me</code> 的请求。</li>
+                        <li>复制 Request Headers 里的完整 Cookie，并粘贴到左侧输入框。</li>
+                      </ol>
+                    </details>
+                  </div>
+                </div>
+              </details>
+            </div>
+          </div>
+
+          <div id="auth-logged-in" class="auth-content auth-connected" hidden>
+            <div class="connected-state">
+              <span class="connected-icon" aria-hidden="true">
+                <svg class="icon"><use href="#icon-check"></use></svg>
+              </span>
+              <div>
+                <strong id="auth-connected-title">账号已安全连接</strong>
+                <p id="auth-account" class="muted">本地登录态可用于后续采集任务。</p>
+              </div>
+            </div>
+            <button id="logout" class="button button-danger-quiet button-small" type="button">
+              退出并清除登录态
+            </button>
+          </div>
+        </section>
+
+        <section id="collect-card" class="panel" aria-labelledby="collect-title">
+          <div class="panel-heading">
+            <div class="panel-title-group">
+              <span class="step-number" aria-hidden="true">02</span>
+              <div>
+                <p class="section-kicker">采集设置</p>
+                <h2 id="collect-title">选择这次要采集的范围</h2>
+                <p class="section-description">同一时间运行一个任务，其余任务会自动排队。</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="source-tabs" role="tablist" aria-label="采集方式">
+            <button id="keyword-tab" class="source-tab is-active" type="button" role="tab"
+                    aria-selected="true" aria-controls="keyword-panel" data-source-tab="keyword">
+              <span class="tab-icon" aria-hidden="true">
+                <svg class="icon"><use href="#icon-search"></use></svg>
+              </span>
+              <span class="tab-copy"><strong>关键词采集</strong><small>指定目标数量，适合主题调研</small></span>
+              <span class="tab-check" aria-hidden="true"><svg class="icon"><use href="#icon-check"></use></svg></span>
+            </button>
+            <button id="user-tab" class="source-tab" type="button" role="tab"
+                    aria-selected="false" aria-controls="user-panel" data-source-tab="user">
+              <span class="tab-icon" aria-hidden="true">
+                <svg class="icon"><use href="#icon-user"></use></svg>
+              </span>
+              <span class="tab-copy"><strong>指定用户采集</strong><small>遍历当前可见的全部公开笔记</small></span>
+              <span class="tab-check" aria-hidden="true"><svg class="icon"><use href="#icon-check"></use></svg></span>
+            </button>
+          </div>
+
+          <form id="collect-form" novalidate>
+            <div class="source-input-surface">
+              <div id="keyword-panel" class="source-panel" role="tabpanel" aria-labelledby="keyword-tab">
+                <div class="form-grid">
+                  <label class="field field-wide">
+                    <span>关键词</span>
+                    <input id="keyword" name="keyword" type="text" minlength="1" maxlength="100"
+                           autocomplete="off" placeholder="例如：露营装备" required>
+                    <small>按搜索结果顺序采集；结果会受登录账号、时间与平台返回影响。</small>
+                  </label>
+                  <label class="field">
+                    <span>目标数量</span>
+                    <input id="keyword-limit" name="limit" type="number" min="1" max="1000" value="50" required>
+                    <small id="keyword-limit-help">实际条数可能因去重、无更多结果或风控而少于目标值。</small>
+                  </label>
+                </div>
+              </div>
+
+              <div id="user-panel" class="source-panel" role="tabpanel" aria-labelledby="user-tab" hidden>
+                <label class="field">
+                  <span>用户主页完整地址</span>
+                  <input id="profile-url" name="profile_url" type="url" inputmode="url"
+                         autocomplete="off" spellcheck="false"
+                         placeholder="https://www.xiaohongshu.com/user/profile/...">
+                  <small>只接受 xiaohongshu.com 的用户主页地址，不支持昵称搜索。</small>
+                </label>
+                <label class="acknowledgement">
+                  <input id="user-all-ack" type="checkbox">
+                  <span>
+                    <strong>我知道这会遍历该用户当前可见的全部公开笔记</strong>
+                    <small>“全部”不是永久完整保证：私密、删除、不可见及平台未返回的笔记不在结果内。</small>
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <fieldset class="preset-section">
+              <legend class="fieldset-heading">
+                <span class="fieldset-title">选择导出内容</span>
+                <span class="fieldset-description">核心字段始终包含笔记 ID、标题、URL 与采集时间</span>
+              </legend>
+              <div class="preset-grid">
+                <label class="preset-card">
+                  <input type="radio" name="preset" value="basic" checked>
+                  <span class="preset-body">
+                    <span class="preset-icon"><svg class="icon" aria-hidden="true"><use href="#icon-file"></use></svg></span>
+                    <span class="preset-title"><strong>基础字段</strong><em>推荐</em></span>
+                    <small>标题、链接、来源位置与作者；请求少、完成快。</small>
+                    <span class="preset-meta">列表数据 · 最快</span>
+                  </span>
+                </label>
+                <label class="preset-card">
+                  <input type="radio" name="preset" value="full">
+                  <span class="preset-body">
+                    <span class="preset-icon"><svg class="icon" aria-hidden="true"><use href="#icon-download"></use></svg></span>
+                    <span class="preset-title"><strong>完整字段</strong></span>
+                    <small>正文、标签、互动指标与媒体链接；逐条请求详情。</small>
+                    <span class="preset-meta">逐条详情 · 信息最全</span>
+                  </span>
+                </label>
+                <label class="preset-card">
+                  <input type="radio" name="preset" value="custom">
+                  <span class="preset-body">
+                    <span class="preset-icon"><svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg></span>
+                    <span class="preset-title"><strong>自定义字段</strong></span>
+                    <small>只采集需要的字段组；详情字段仍会逐条请求。</small>
+                    <span class="preset-meta">按需选择 · 更灵活</span>
+                  </span>
+                </label>
+              </div>
+
+              <div id="custom-fields" class="custom-fields" hidden>
+                <p>选择至少一个字段组</p>
+                <div class="check-grid">
+                  <label><input type="checkbox" name="field_group" value="author" checked> 作者</label>
+                  <label><input type="checkbox" name="field_group" value="body"> 正文与时间</label>
+                  <label><input type="checkbox" name="field_group" value="tags"> 标签</label>
+                  <label><input type="checkbox" name="field_group" value="metrics"> 互动指标</label>
+                  <label><input type="checkbox" name="field_group" value="media"> 媒体链接</label>
+                </div>
+              </div>
+            </fieldset>
+
+            <div id="estimate" class="estimate" aria-live="polite">
+              <span class="estimate-icon" aria-hidden="true">
+                <svg class="icon"><use href="#icon-clock"></use></svg>
+              </span>
+              <div>
+                <span class="estimate-label">请求与时间预估</span>
+                <strong>预计耗时：约 1–3 分钟</strong>
+                <small>估算仅用于安排等待时间，网络、风控和平台响应会造成较大波动。</small>
+              </div>
+            </div>
+
+            <div id="form-error" class="form-error" role="alert" hidden></div>
+            <div class="form-actions form-submit-row">
+              <button id="create-job" class="button button-primary button-large" type="submit" disabled>
+                <svg class="icon" aria-hidden="true"><use href="#icon-play"></use></svg>
+                <span>请先完成登录</span>
+              </button>
+              <p class="muted compact">默认间隔请求，不提供代理轮换或风控绕过。</p>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel jobs-panel" aria-labelledby="jobs-title">
+          <div class="panel-heading">
+            <div class="panel-title-group">
+              <span class="step-number" aria-hidden="true">03</span>
+              <div>
+                <p class="section-kicker">任务中心</p>
+                <h2 id="jobs-title">查看进度并下载数据</h2>
+                <p class="section-description">页面刷新或服务重启后，任务记录仍会保留。</p>
+              </div>
+            </div>
+            <div class="connection-group panel-actions">
+              <button id="refresh-jobs" class="button button-secondary button-small" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#icon-refresh"></use></svg>
+                <span>刷新</span>
+              </button>
+              <button id="clear-data" class="button button-danger-quiet button-small" type="button">
+                <svg class="icon" aria-hidden="true"><use href="#icon-trash"></use></svg>
+                <span>清除本地数据</span>
+              </button>
+            </div>
+          </div>
+
+          <div id="jobs-empty" class="empty-state">
+            <span class="empty-icon" aria-hidden="true"><svg class="icon"><use href="#icon-inbox"></use></svg></span>
+            <strong>还没有采集任务</strong>
+            <p>完成上面的设置并开始采集，进度和下载文件会出现在这里。</p>
+          </div>
+          <div id="jobs-list" class="jobs-list"></div>
+        </section>
+      </div>
+
+      <section class="boundary-note" aria-labelledby="boundary-title">
+        <span class="boundary-icon" aria-hidden="true"><svg class="icon"><use href="#icon-shield"></use></svg></span>
+        <div>
+          <h2 id="boundary-title">使用边界</h2>
+          <p id="boundary-copy">
+            CrimsonFlux 只整理登录账号当前可见的公开内容，不绕过访问控制，不保证平台结果完整或长期可复现。
+            请勿用于骚扰、画像、转售数据或其他侵害他人权益的用途。
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="detail-confirm-dialog" class="confirm-dialog" aria-labelledby="confirm-title">
+      <form method="dialog">
+        <button class="dialog-close" value="cancel" aria-label="关闭">
+          <svg class="icon" aria-hidden="true"><use href="#icon-close"></use></svg>
+        </button>
+        <span class="dialog-icon" aria-hidden="true"><svg class="icon"><use href="#icon-download"></use></svg></span>
+        <p class="section-kicker">需要再次确认</p>
+        <h2 id="confirm-title">是否逐条采集所选详情？</h2>
+        <p id="confirm-summary"></p>
+        <div class="warning-box">
+          <svg class="icon" aria-hidden="true"><use href="#icon-clock"></use></svg>
+          <div>
+            <strong id="confirm-estimate">预计耗时正在计算</strong>
+            <p>详情请求会显著增加运行时间与触发平台限流的概率。取消不会删除已经列出的基础数据。</p>
+          </div>
+        </div>
+        <div class="dialog-actions">
+          <button class="button button-quiet" value="cancel">稍后决定</button>
+          <button id="export-basic" class="button button-secondary" type="button">仅导出基础字段</button>
+          <button id="confirm-details" class="button button-primary" type="button">确认并继续</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" hidden></div>
+    <div id="sr-status" class="sr-only" role="status" aria-live="polite"></div>
+  </body>
+</html>

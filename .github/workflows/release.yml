@@ -1,0 +1,150 @@
+name: gated-source-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  g1-native:
+    name: G1 native / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.27"
+          enable-cache: true
+      - name: Install locked security test environment
+        run: |
+          python scripts/start.py --prepare-only
+          uv sync --frozen --extra dev
+      - name: Produce native G1 evidence
+        shell: bash
+        run: |
+          mkdir -p dist/g1
+          uv run python scripts/verify_g1.py \
+            --output "dist/g1/g1-native-${{ runner.os }}-${{ runner.arch }}.json"
+      - name: Upload native G1 evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: g1-native-${{ runner.os }}-${{ runner.arch }}
+          path: dist/g1/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: protected release build
+    needs: g1-native
+    runs-on: ubuntu-24.04
+    environment: live-release
+    env:
+      CRIMSONFLUX_RELEASE_G1_APPROVAL_REF: ${{ vars.G1_APPROVAL_REF }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.9.27"
+          enable-cache: true
+      - name: Verify tag and protected approvals
+        shell: bash
+        run: |
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "${{ inputs.tag }}" = "v${version}"
+          test -n "$CRIMSONFLUX_RELEASE_G1_APPROVAL_REF"
+          python scripts/doctor.py --release
+      - name: Install and verify locked source
+        run: |
+          python scripts/start.py --prepare-only
+          python scripts/check_locks.py
+          uv sync --frozen --extra dev
+          python scripts/check_skeleton.py
+          uv run pytest
+          uv run ruff check src tests scripts
+          uv run mypy src
+      - name: Build reference container locally
+        run: |
+          docker compose config --quiet
+          docker compose build --pull
+      - name: Download native G1 evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: g1-native-*
+          path: dist/g1
+          merge-multiple: true
+      - name: Verify native evidence and attest container parity
+        shell: bash
+        run: |
+          for evidence in dist/g1/*.json; do
+            python scripts/verify_g1.py --verify "$evidence"
+          done
+          uv run python scripts/verify_g1.py \
+            --container-image crimsonflux:local \
+            --output dist/g1/g1-container-Linux-X64.json
+      - name: Prepare release artifact directory
+        run: mkdir -p dist/source
+      - name: Generate reference-container SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: crimsonflux:local
+          format: spdx-json
+          output-file: dist/source/container.spdx.json
+      - name: Create source archive and dependency inventories
+        shell: bash
+        run: |
+          python scripts/archive_source.py --release
+          python scripts/scan_release.py --archive dist/source
+          uv export --frozen --no-dev --no-emit-project --format requirements-txt --output-file dist/source/python-dependencies.txt
+          cp THIRD_PARTY_NOTICES.md dist/source/THIRD_PARTY_NOTICES.md
+          cp dist/g1/*.json dist/source/
+      - name: Stage reviewed release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-release-${{ inputs.tag }}
+          path: dist/source/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish immutable prerelease
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download reviewed release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: source-release-${{ inputs.tag }}
+          path: dist/source
+      - name: Publish immutable prerelease assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.tag }}" dist/source/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --prerelease \
+            --title "XHS Insight ${{ inputs.tag }} source preview" \
+            --notes "Protected source preview. Review README, THIRD_PARTY_NOTICES.md, and docs/RELEASE_GATES.md before use."
