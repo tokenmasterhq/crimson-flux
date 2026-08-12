@@ -222,10 +222,90 @@
 
               <details id="manual-login" class="manual-login-disclosure">
                 <summary>
-                  <span><strong>扫码不可用？手动导入 Cookie</strong><small>Docker 与无图形界面环境使用此方式</small></span>
+                  <span>
+                    <strong id="manual-login-title">扫码不可用？手动导入 Cookie</strong>
+                    <small id="manual-login-subtitle">Docker 与无图形界面环境使用此方式</small>
+                  </span>
                   <svg class="icon" aria-hidden="true"><use href="#icon-chevron"></use></svg>
                 </summary>
+                <div id="manual-login-recommendation"
+                     class="manual-login-recommendation"
+                     role="status" aria-live="polite" aria-atomic="true" hidden>
+                  <svg class="icon" aria-hidden="true"><use href="#icon-alert"></use></svg>
+                  <p>
+                    <strong>扫码确认已完成，但还需要网页验证</strong>
+                    <span>当前安全模式无法在本页自动完成。请先在官方网页完成登录，再从下方导入 Cookie。</span>
+                  </p>
+                </div>
                 <div class="manual-login-content">
+                  <div class="auth-guide">
+                    <div class="guide-heading">
+                      <span class="guide-icon" aria-hidden="true">
+                        <svg class="icon"><use href="#icon-shield"></use></svg>
+                      </span>
+                      <div>
+                        <strong>只从官方网页复制</strong>
+                        <p>另开一个普通 Chrome 或 Edge 标签页，在官方网页完成全部验证；下面的操作都在那个官方网页标签页中进行。</p>
+                      </div>
+                    </div>
+                    <a class="guide-open-link" href="https://www.xiaohongshu.com/"
+                       target="_blank" rel="noopener noreferrer">
+                      <span>打开官方网页</span>
+                      <svg class="icon icon-directional" aria-hidden="true"><use href="#icon-arrow"></use></svg>
+                    </a>
+                    <details class="help-disclosure" open>
+                      <summary>
+                        <span>5 步安全导入方法</span>
+                        <svg class="icon" aria-hidden="true"><use href="#icon-chevron"></use></svg>
+                      </summary>
+                      <ol class="auth-guide-steps">
+                        <li>
+                          <div>
+                            <strong>打开开发者工具</strong>
+                            <p>在官方网页按 <kbd>F12</kbd>（macOS 可按 <kbd>⌥⌘I</kbd>），然后选择 <code>Network</code>。</p>
+                          </div>
+                        </li>
+                        <li>
+                          <div>
+                            <strong>开始录制并刷新</strong>
+                            <p>确认录制圆点为红色，清空旧记录后刷新官方网页，让最新请求出现在列表中。</p>
+                          </div>
+                        </li>
+                        <li>
+                          <div>
+                            <strong>筛选账号验证请求</strong>
+                            <p>在筛选框输入 <code>/api/sns/web/v2/user/me</code>，选择最新且状态正常的 <code>user/me</code> 请求。</p>
+                          </div>
+                        </li>
+                        <li>
+                          <div>
+                            <strong>只复制 Cookie 的值</strong>
+                            <p>进入 <code>Headers</code> → <code>Request Headers</code>，找到 <code>Cookie:</code>，复制冒号之后的完整值，其他内容不要复制。</p>
+                            <p class="guide-caution">不要使用 <code>document.cookie</code>、<code>Copy as cURL</code>，也不要复制整块 Request Headers。</p>
+                          </div>
+                        </li>
+                        <li>
+                          <div>
+                            <strong>回到本页保存并清理</strong>
+                            <p>粘贴到“官方网页登录态 Cookie”输入框并点击“验证并加密保存”。成功后输入框会清空；请再复制一段普通文字，覆盖系统剪贴板。</p>
+                          </div>
+                        </li>
+                      </ol>
+                    </details>
+                    <details class="troubleshooting-disclosure">
+                      <summary>
+                        <span>导入失败怎么办？</span>
+                        <svg class="icon" aria-hidden="true"><use href="#icon-chevron"></use></svg>
+                      </summary>
+                      <ul>
+                        <li>确认官方网页已完成全部验证，并保持登录状态。</li>
+                        <li>刷新页面后重新选择最新的 <code>user/me</code> 请求。</li>
+                        <li>确认内容仅为 <code>Cookie:</code> 后面的值，没有前缀、换行或其他请求头。</li>
+                        <li>若登录态已经过期，请重新登录后再按上述步骤复制。</li>
+                      </ul>
+                    </details>
+                  </div>
+
                   <form id="login-form" class="auth-import-form" autocomplete="off">
                     <label class="field">
                       <span>官方网页登录态 Cookie</span>
@@ -247,29 +327,6 @@
                     </button>
                     <small class="muted">不要通过截图、聊天或公开 issue 发送 Cookie。</small>
                   </form>
-
-                  <div class="auth-guide">
-                    <div class="guide-heading">
-                      <span class="guide-icon" aria-hidden="true">
-                        <svg class="icon"><use href="#icon-shield"></use></svg>
-                      </span>
-                      <div>
-                        <strong>只从官方网页复制</strong>
-                        <p>应用仍会先验证账号，再把凭证加密保存在这台设备上。</p>
-                      </div>
-                    </div>
-                    <details class="help-disclosure">
-                      <summary>
-                        <span>查看 3 步复制方法</span>
-                        <svg class="icon" aria-hidden="true"><use href="#icon-chevron"></use></svg>
-                      </summary>
-                      <ol>
-                        <li>先在内容平台官方网页完成登录。</li>
-                        <li>打开开发者工具的 Network，找到发往 <code>edith.xiaohongshu.com/api/sns/web/v2/user/me</code> 的请求。</li>
-                        <li>复制 Request Headers 里的完整 Cookie，并粘贴到左侧输入框。</li>
-                      </ol>
-                    </details>
-                  </div>
                 </div>
               </details>
             </div>

@@ -111,10 +111,7 @@ class RedNoteProtocolError(RuntimeError):
         super().__init__(f"{operation} failed ({kind.value})")
 
     def __repr__(self) -> str:
-        return (
-            f"RedNoteProtocolError(kind={self.kind.value!r}, "
-            f"operation={self.operation!r})"
-        )
+        return f"RedNoteProtocolError(kind={self.kind.value!r}, operation={self.operation!r})"
 
 
 class CookieView(Mapping[str, str]):
@@ -196,6 +193,28 @@ class RequestSigner(Protocol):
     ) -> Mapping[str, str]: ...
 
 
+def _validate_signed_headers(signed: Any) -> dict[str, str]:
+    """Normalize only the bounded signer headers allowed onto the wire."""
+
+    if not isinstance(signed, Mapping):
+        raise RedNoteProtocolError(FailureKind.SIGNER, "signed headers")
+    headers: dict[str, str] = {}
+    for raw_name, raw_value in signed.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            raise RedNoteProtocolError(FailureKind.SIGNER, "signed headers")
+        name = raw_name.casefold()
+        if (
+            name not in _SAFE_SIGNED_HEADERS
+            or not raw_value
+            or len(raw_value) > 32 * 1024
+            or "\r" in raw_value
+            or "\n" in raw_value
+        ):
+            raise RedNoteProtocolError(FailureKind.SIGNER, "signed headers")
+        headers[name] = raw_value
+    return headers
+
+
 class XhshowSigner:
     """Small adapter over public APIs exported by ``xhshow==0.2.0``."""
 
@@ -205,10 +224,21 @@ class XhshowSigner:
             self._client = xhshow.Xhshow(config)
             self._session = xhshow.SessionManager(config)
             self.user_agent = str(config.PUBLIC_USERAGENT)
+            self._fingerprint_lock = threading.Lock()
+            self._x_s_common: str | None = None
         except Exception:
-            raise RedNoteProtocolError(
-                FailureKind.SIGNER, "signer initialization"
-            ) from None
+            raise RedNoteProtocolError(FailureKind.SIGNER, "signer initialization") from None
+
+    def _stabilize_headers(self, signed: Any) -> Mapping[str, str]:
+        headers = _validate_signed_headers(signed)
+        generated_common = headers.get("x-s-common")
+        if generated_common is None:
+            raise RedNoteProtocolError(FailureKind.SIGNER, "signed headers")
+        with self._fingerprint_lock:
+            if self._x_s_common is None:
+                self._x_s_common = generated_common
+            headers["x-s-common"] = self._x_s_common
+        return headers
 
     def generate_a1(self) -> str:
         try:
@@ -232,9 +262,7 @@ class XhshowSigner:
         try:
             return str(self._client.get_search_request_id())
         except Exception:
-            raise RedNoteProtocolError(
-                FailureKind.SIGNER, "search request id"
-            ) from None
+            raise RedNoteProtocolError(FailureKind.SIGNER, "search request id") from None
 
     def build_url(self, path: str, params: Mapping[str, Any]) -> str:
         try:
@@ -253,7 +281,7 @@ class XhshowSigner:
         x_rap: bool,
     ) -> Mapping[str, str]:
         try:
-            return self._client.sign_headers_get(
+            signed = self._client.sign_headers_get(
                 path,
                 dict(cookies),
                 params=dict(params),
@@ -264,6 +292,7 @@ class XhshowSigner:
             )
         except Exception:
             raise RedNoteProtocolError(FailureKind.SIGNER, "GET signing") from None
+        return self._stabilize_headers(signed)
 
     def sign_post(
         self,
@@ -276,7 +305,7 @@ class XhshowSigner:
         x_rap: bool,
     ) -> Mapping[str, str]:
         try:
-            return self._client.sign_headers_post(
+            signed = self._client.sign_headers_post(
                 path,
                 dict(cookies),
                 payload=dict(payload),
@@ -287,6 +316,7 @@ class XhshowSigner:
             )
         except Exception:
             raise RedNoteProtocolError(FailureKind.SIGNER, "POST signing") from None
+        return self._stabilize_headers(signed)
 
 
 class HttpxJsonTransport:
@@ -327,9 +357,7 @@ class HttpxJsonTransport:
                 for chunk in response.iter_bytes():
                     retained.extend(chunk)
                     if len(retained) > max_response_bytes:
-                        raise RedNoteProtocolError(
-                            FailureKind.SCHEMA, "bounded response"
-                        )
+                        raise RedNoteProtocolError(FailureKind.SCHEMA, "bounded response")
                 for cookie in response.cookies.jar:
                     cookie_name = cookie.name
                     cookie_value = cookie.value
@@ -382,9 +410,7 @@ def _parse_retry_after(value: Any) -> int | None:
                 return None
             seconds = max(
                 0,
-                math.ceil(
-                    (parsed.astimezone(UTC) - datetime.now(UTC)).total_seconds()
-                ),
+                math.ceil((parsed.astimezone(UTC) - datetime.now(UTC)).total_seconds()),
             )
         except (OverflowError, TypeError, ValueError):
             return None
@@ -473,8 +499,7 @@ def _validate_query_component(
     if not isinstance(value, str) or len(value) > maximum or (not value and not allow_empty):
         raise RedNoteProtocolError(FailureKind.SCHEMA, label)
     if any(
-        character in "&#?" or ord(character) < 0x20 or ord(character) == 0x7F
-        for character in value
+        character in "&#?" or ord(character) < 0x20 or ord(character) == 0x7F for character in value
     ):
         raise RedNoteProtocolError(FailureKind.SCHEMA, label)
     return value
@@ -547,9 +572,7 @@ class RedNoteClient:
             except RedNoteProtocolError:
                 raise
             except Exception:
-                raise RedNoteProtocolError(
-                    FailureKind.SIGNER, "visitor identity"
-                ) from None
+                raise RedNoteProtocolError(FailureKind.SIGNER, "visitor identity") from None
             self._cookies.update({"a1": a1, "webId": web_id})
         if not self._cookies.get("a1") or (
             cookie is not None and not self._cookies.get("web_session")
@@ -589,9 +612,10 @@ class RedNoteClient:
         for name, value in values.items():
             if _valid_cookie_pair(name, value):
                 self._cookies[name] = value
-        if len(self._cookies) > _MAX_COOKIE_COUNT or len(
-            _cookie_header(self._cookies).encode("utf-8")
-        ) > _MAX_COOKIE_BYTES:
+        if (
+            len(self._cookies) > _MAX_COOKIE_COUNT
+            or len(_cookie_header(self._cookies).encode("utf-8")) > _MAX_COOKIE_BYTES
+        ):
             self._cookies.clear()
             self._cookies.update(previous)
             raise RedNoteProtocolError(FailureKind.SCHEMA, "response cookies")
@@ -714,25 +738,8 @@ class RedNoteClient:
             except Exception:
                 raise RedNoteProtocolError(FailureKind.SIGNER, operation) from None
 
-            if not isinstance(signed, Mapping):
-                raise RedNoteProtocolError(FailureKind.SIGNER, "signed headers")
             target_url = _validate_request_target(origin, request_path, path)
-
-            signed_headers: dict[str, str] = {}
-            for raw_name, raw_value in signed.items():
-                if not isinstance(raw_name, str) or not isinstance(raw_value, str):
-                    raise RedNoteProtocolError(FailureKind.SIGNER, "signed headers")
-                name = raw_name.casefold()
-                value = raw_value
-                if (
-                    name not in _SAFE_SIGNED_HEADERS
-                    or not value
-                    or len(value) > 32 * 1024
-                    or "\r" in value
-                    or "\n" in value
-                ):
-                    raise RedNoteProtocolError(FailureKind.SIGNER, "signed headers")
-                signed_headers[name] = value
+            signed_headers = _validate_signed_headers(signed)
             user_agent = self._signer.user_agent
             if (
                 not isinstance(user_agent, str)
@@ -772,18 +779,19 @@ class RedNoteClient:
                 raise
             except Exception:
                 raise RedNoteProtocolError(FailureKind.NETWORK, operation) from None
+            # Browsers accept valid Set-Cookie fields even when the HTTP response
+            # is not successful. The target has already passed the fixed endpoint
+            # allowlist, and _merge_cookies applies the local size/format bounds.
+            self._merge_cookies(response.cookies)
             self._classify_response(response, operation)
             if not isinstance(response.body, Mapping):
                 raise RedNoteProtocolError(FailureKind.SCHEMA, operation)
             success = response.body.get("success")
             if success is not True:
-                raise self._upstream_failure(
-                    response.body, operation, response.retry_after
-                )
+                raise self._upstream_failure(response.body, operation, response.retry_after)
             data = response.body.get("data")
             if not isinstance(data, Mapping):
                 raise RedNoteProtocolError(FailureKind.SCHEMA, operation)
-            self._merge_cookies(response.cookies)
             return dict(data)
 
     def login_activate(self) -> Mapping[str, Any]:
@@ -795,9 +803,7 @@ class RedNoteClient:
         )
         session = data.get("session")
         if session:
-            self._cookies["web_session"] = _validate_token(
-                session, "visitor session", minimum=8
-            )
+            self._cookies["web_session"] = _validate_token(session, "visitor session", minimum=8)
         if not self._cookies.get("web_session"):
             raise RedNoteProtocolError(FailureKind.SCHEMA, "visitor session")
         return data
@@ -833,30 +839,13 @@ class RedNoteClient:
     def complete_qr(self, qr_id: str, code: str) -> Mapping[str, Any]:
         identifier = _validate_token(qr_id, "QR id", maximum=512)
         check_code = _validate_token(code, "QR code", maximum=512)
-        visitor_session = str(self._cookies.get("web_session") or "")
-        data = self._request(
+        return self._request(
             "GET",
             "/api/sns/web/v1/login/qrcode/status",
             params={"qr_id": identifier, "code": check_code},
             extra_headers={"x-login-mode": ""},
             operation="QR complete",
         )
-        status = data.get("code_status")
-        login_info = data.get("login_info")
-        if type(status) is not int or status != 2 or not isinstance(login_info, Mapping):
-            raise RedNoteProtocolError(FailureKind.SCHEMA, "QR completion status")
-        formal_session = _validate_token(
-            login_info.get("session"), "authenticated session", minimum=8
-        )
-        if formal_session == visitor_session:
-            raise RedNoteProtocolError(FailureKind.SCHEMA, "authenticated session")
-        self._cookies["web_session"] = formal_session
-        secure_session = login_info.get("secure_session")
-        if secure_session:
-            self._cookies["web_session_sec"] = _validate_token(
-                secure_session, "secure session", minimum=8
-            )
-        return data
 
     def get_user_me(self) -> Mapping[str, Any]:
         return self._request(
@@ -868,9 +857,7 @@ class RedNoteClient:
 
     def new_search_id(self) -> str:
         try:
-            return _validate_token(
-                self._signer.new_search_id(), "search id", maximum=128
-            )
+            return _validate_token(self._signer.new_search_id(), "search id", maximum=128)
         except RedNoteProtocolError:
             raise
         except Exception:
@@ -897,9 +884,7 @@ class RedNoteClient:
         except RedNoteProtocolError:
             raise
         except Exception:
-            raise RedNoteProtocolError(
-                FailureKind.SIGNER, "search request id"
-            ) from None
+            raise RedNoteProtocolError(FailureKind.SIGNER, "search request id") from None
         payload = {
             "keyword": keyword,
             "page": page,
@@ -937,9 +922,7 @@ class RedNoteClient:
         validated_xsec = _validate_query_component(
             xsec_token, "user access token", maximum=2048, allow_empty=True
         )
-        access_source = _validate_query_component(
-            xsec_source, "user access source", maximum=128
-        )
+        access_source = _validate_query_component(xsec_source, "user access source", maximum=128)
         return self._request(
             "GET",
             "/api/sns/web/v1/user_posted",
@@ -957,9 +940,7 @@ class RedNoteClient:
             operation="user notes",
         )
 
-    def note_detail(
-        self, note_id: str, *, xsec_token: str, xsec_source: str
-    ) -> Mapping[str, Any]:
+    def note_detail(self, note_id: str, *, xsec_token: str, xsec_source: str) -> Mapping[str, Any]:
         if not self._cookies.get("web_session"):
             raise RedNoteProtocolError(FailureKind.AUTH, "note detail")
         return self._request(
