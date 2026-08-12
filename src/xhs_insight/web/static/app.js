@@ -16,10 +16,16 @@
     "cancelled",
     "failed",
   ]);
-  const BROWSER_LOGIN_ACTIVE = new Set(["starting", "awaiting_scan", "verifying"]);
+  const BROWSER_LOGIN_ACTIVE = new Set([
+    "starting",
+    "awaiting_scan",
+    "awaiting_phone_confirmation",
+    "verifying",
+  ]);
   const BROWSER_LOGIN_LABELS = {
     starting: "正在生成",
     awaiting_scan: "等待扫码",
+    awaiting_phone_confirmation: "等待手机确认",
     verifying: "正在验证",
     succeeded: "登录成功",
     failed: "登录未完成",
@@ -28,6 +34,9 @@
     cancelled: "已取消",
     idle: "尚未开始",
   };
+  const PLATFORM_CHALLENGE_REQUIRED = "PLATFORM_CHALLENGE_REQUIRED";
+  const PLATFORM_CHALLENGE_MESSAGE =
+    "手机确认已完成，但平台要求额外网页验证；当前安全模式无法在页内自动完成。";
 
   const STATUS_LABELS = {
     queued: "等待运行",
@@ -97,6 +106,9 @@
     browserLoginCountdown: document.querySelector("#browser-login-countdown"),
     cancelBrowserLogin: document.querySelector("#cancel-browser-login"),
     manualLogin: document.querySelector("#manual-login"),
+    manualLoginTitle: document.querySelector("#manual-login-title"),
+    manualLoginSubtitle: document.querySelector("#manual-login-subtitle"),
+    manualLoginRecommendation: document.querySelector("#manual-login-recommendation"),
     logout: document.querySelector("#logout"),
     collectForm: document.querySelector("#collect-form"),
     sourceTabs: document.querySelector(".source-tabs"),
@@ -345,6 +357,7 @@
     const browserSupported = collector.browser_login_supported === true;
     const collectionReady = collector.collection_runtime_ok === true;
     const browserActive = BROWSER_LOGIN_ACTIVE.has(state.browserLogin?.status);
+    const challengeRequired = isPlatformChallengeRequired(state.browserLogin);
     const qrRetryAllowed =
       state.browserLogin?.status === "awaiting_scan" && state.browserQrError;
     elements.authAction.disabled =
@@ -360,9 +373,11 @@
     elements.importLogin.disabled = !importSupported || browserActive;
     elements.browserLogin.disabled =
       !browserSupported || (browserActive && !qrRetryAllowed);
-    elements.browserLoginCapability.textContent = browserSupported
-      ? `二维码有效期约 ${collector.browser_login_timeout_seconds || 180} 秒 · 扫码确认后自动完成验证`
-      : collector.browser_login_reason || "当前环境不支持扫码；可以展开下方手动导入。";
+    elements.browserLoginCapability.textContent = challengeRequired
+      ? "重新扫码可能仍会遇到相同验证，建议使用下方 Cookie 导入。"
+      : browserSupported
+        ? `二维码有效期约 ${collector.browser_login_timeout_seconds || 180} 秒 · 扫码后请按手机提示完成确认或验证`
+        : collector.browser_login_reason || "当前环境不支持扫码；可以展开下方手动导入。";
     if (!browserSupported && importSupported && !state.manualLoginAutoOpened) {
       elements.manualLogin.open = true;
       state.manualLoginAutoOpened = true;
@@ -406,11 +421,45 @@
   }
 
   function browserLoginVariant(status) {
-    if (["starting", "awaiting_scan", "verifying"].includes(status)) return "running";
+    if (
+      ["starting", "awaiting_scan", "awaiting_phone_confirmation", "verifying"].includes(
+        status,
+      )
+    ) {
+      return "running";
+    }
     if (status === "succeeded") return "success";
     if (status === "expired") return "warning";
     if (["failed", "browser_closed"].includes(status)) return "danger";
     return "neutral";
+  }
+
+  function isPlatformChallengeRequired(payload) {
+    return (
+      payload?.status === "failed" &&
+      payload?.error_code === PLATFORM_CHALLENGE_REQUIRED
+    );
+  }
+
+  function browserLoginDisplayMessage(payload, fallback) {
+    if (isPlatformChallengeRequired(payload)) return PLATFORM_CHALLENGE_MESSAGE;
+    return payload?.message || fallback;
+  }
+
+  function renderManualLoginFallback(payload) {
+    const recommended = isPlatformChallengeRequired(payload);
+    elements.manualLogin.classList.toggle("is-recommended", recommended);
+    elements.manualLoginRecommendation.hidden = !recommended;
+    elements.manualLoginTitle.textContent = recommended
+      ? "建议改用 Cookie 导入"
+      : "扫码不可用？手动导入 Cookie";
+    elements.manualLoginSubtitle.textContent = recommended
+      ? "先在官方网页完成额外验证，再把网页登录态安全保存到本机"
+      : "Docker 与无图形界面环境使用此方式";
+    if (recommended) {
+      elements.manualLogin.open = true;
+      state.manualLoginAutoOpened = true;
+    }
   }
 
   function releaseBrowserQrObjectUrl() {
@@ -555,7 +604,10 @@
     const status = state.browserLogin.status || "idle";
     const active = BROWSER_LOGIN_ACTIVE.has(status);
     const visible = status !== "idle";
+    const challengeRequired = isPlatformChallengeRequired(state.browserLogin);
     const terminalMessage = {
+      awaiting_phone_confirmation:
+        "已扫码，请按手机提示完成确认；如要求短信验证，请在手机端完成。",
       failed: "登录未完成，请重新获取二维码",
       browser_closed: "登录会话已关闭，请重新获取二维码",
       expired: "二维码已过期，请重新获取",
@@ -565,6 +617,7 @@
     };
     if (
       [
+        "awaiting_phone_confirmation",
         "verifying",
         "succeeded",
         "failed",
@@ -576,8 +629,10 @@
       status !== previousStatus
     ) {
       resetBrowserQr({
-        message: terminalMessage[status] || "正在验证登录…",
-        visualState: status,
+        message: challengeRequired
+          ? "需要额外网页验证"
+          : terminalMessage[status] || "正在验证登录…",
+        visualState: challengeRequired ? "challenge" : status,
       });
     } else if (status === "starting" && previousStatus !== "starting") {
       resetBrowserQr({ message: "正在生成登录二维码…", visualState: "loading" });
@@ -589,12 +644,9 @@
     ) {
       resetBrowserQr({ message: "二维码已刷新，正在加载新二维码…", visualState: "loading" });
     }
-    const terminalWithoutProgress = [
-      "cancelled",
-      "expired",
-      "browser_closed",
-      "failed",
-    ].includes(status);
+    const terminalWithoutProgress =
+      ["cancelled", "expired", "browser_closed", "failed"].includes(status) &&
+      !challengeRequired;
     elements.browserLoginProgress.hidden = !visible || terminalWithoutProgress;
     elements.cancelBrowserLogin.hidden = !active;
     setPill(
@@ -602,11 +654,12 @@
       BROWSER_LOGIN_LABELS[status] || "状态未知",
       browserLoginVariant(status),
     );
-    elements.browserLoginMessage.textContent =
-      state.browserLogin.message ||
-      (status === "awaiting_scan"
+    elements.browserLoginMessage.textContent = browserLoginDisplayMessage(
+      state.browserLogin,
+      status === "awaiting_scan"
         ? "请使用平台官方 App 扫描二维码，并在手机上确认。"
-        : terminalMessage[status] || "正在准备登录二维码…");
+        : terminalMessage[status] || "正在准备登录二维码…",
+    );
     updateBrowserLoginCountdown(status, state.browserLogin);
     if (status !== previousStatus) {
       elements.srStatus.textContent = elements.browserLoginMessage.textContent;
@@ -621,11 +674,15 @@
             ? state.browserQrLoaded
               ? "等待扫码确认"
               : "正在加载二维码…"
-            : status === "verifying"
-              ? "正在验证…"
-              : ["failed", "expired", "cancelled", "browser_closed"].includes(status)
-                ? "重新获取二维码"
-                : "获取登录二维码",
+            : status === "awaiting_phone_confirmation"
+              ? "等待手机确认"
+              : status === "verifying"
+                ? "正在验证…"
+                : challengeRequired
+                  ? "仍要尝试扫码"
+                  : ["failed", "expired", "cancelled", "browser_closed"].includes(status)
+                    ? "重新获取二维码"
+                    : "获取登录二维码",
     );
     if (
       status === "awaiting_scan" &&
@@ -635,6 +692,7 @@
     ) {
       void loadBrowserQrImage({ quiet: true });
     }
+    renderManualLoginFallback(state.browserLogin);
     renderAuth(state.auth);
   }
 
@@ -657,7 +715,10 @@
         await loadAuth({ quiet: true });
         showToast("扫码登录成功，登录态已加密保存在本机。", false);
       } else if (["failed", "expired"].includes(current) && current !== previous) {
-        showToast(result?.message || "扫码登录未完成，请重试。", true);
+        showToast(
+          browserLoginDisplayMessage(result, "扫码登录未完成，请检查页面提示。"),
+          true,
+        );
       }
       return result;
     } catch (error) {
@@ -720,7 +781,7 @@
       }
       elements.cookieInput.value = "";
       await loadAuth();
-      showToast("登录态验证成功并已加密保存。", false);
+      showToast("登录态已加密保存，输入框已清空。请复制一段普通文字覆盖系统剪贴板。", false);
     } catch (error) {
       showToast(humanError(error), true);
     } finally {

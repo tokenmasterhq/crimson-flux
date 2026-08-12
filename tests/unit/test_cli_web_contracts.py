@@ -269,6 +269,15 @@ def test_login_defaults_to_official_browser_scan(monkeypatch: pytest.MonkeyPatch
                 return self.health
             assert path == "/auth/browser/status"
             self.status_reads += 1
+            if self.status_reads == 1:
+                return {
+                    "status": "awaiting_phone_confirmation",
+                    "authenticated": False,
+                    "message": (
+                        "已扫码，请按手机提示完成确认；"
+                        "如要求短信验证，请在手机端完成。"
+                    ),
+                }
             return {
                 "status": "succeeded",
                 "authenticated": True,
@@ -282,10 +291,11 @@ def test_login_defaults_to_official_browser_scan(monkeypatch: pytest.MonkeyPatch
     result = runner.invoke(cli_app.app, ["login"])
 
     assert result.exit_code == 0, result.output
-    assert fake.status_reads == 1
+    assert fake.status_reads == 2
     assert "登录二维码已生成" in result.output
     assert "http://127.0.0.1:8765" in result.output
     assert "直接扫描页面中的二维码" in result.output
+    assert "如要求短信验证，请在手机端完成" in result.output
     assert "官方小红书窗口" not in result.output
     assert "扫码登录成功" in result.output
 
@@ -466,6 +476,117 @@ def test_web_contract_has_no_runtime_demo_mode_and_keeps_export_controls() -> No
     assert "state.browserQrRevision !== nextQrRevision" in script
     assert 'cache: "no-store"' in script
     assert "/auth/qr" not in script
+    assert 'awaiting_phone_confirmation: "等待手机确认"' in script
+    assert "已扫码，请按手机提示完成确认；如要求短信验证，请在手机端完成。" in script
+    assert 'status === "awaiting_phone_confirmation"' in script
+    browser_active_statuses = script[
+        script.index("const BROWSER_LOGIN_ACTIVE") : script.index(
+            "const BROWSER_LOGIN_LABELS"
+        )
+    ]
+    assert '"awaiting_phone_confirmation"' in browser_active_statuses
+    assert "browser-verification" not in template
+    assert "/auth/browser/verification" not in script
+
+
+def test_web_platform_challenge_recommends_cookie_fallback_without_retry_loop() -> None:
+    root = Path(__file__).resolve().parents[2]
+    template = (root / "src/xhs_insight/web/templates/index.html").read_text(
+        encoding="utf-8"
+    )
+    script = (root / "src/xhs_insight/web/static/app.js").read_text(
+        encoding="utf-8"
+    )
+    styles = (root / "src/xhs_insight/web/static/styles.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'id="manual-login-recommendation"' in template
+    assert 'role="status" aria-live="polite" aria-atomic="true"' in template
+    assert "扫码确认已完成，但还需要网页验证" in template
+    assert "当前安全模式无法在本页自动完成" in template
+
+    assert 'const PLATFORM_CHALLENGE_REQUIRED = "PLATFORM_CHALLENGE_REQUIRED"' in script
+    assert "手机确认已完成，但平台要求额外网页验证" in script
+    assert "当前安全模式无法在页内自动完成" in script
+    fallback_branch = script[
+        script.index("function renderManualLoginFallback") : script.index(
+            "function releaseBrowserQrObjectUrl"
+        )
+    ]
+    assert 'classList.toggle("is-recommended", recommended)' in fallback_branch
+    assert "elements.manualLoginRecommendation.hidden = !recommended" in fallback_branch
+    assert "elements.manualLogin.open = true" in fallback_branch
+    assert 'state.manualLoginAutoOpened = true' in fallback_branch
+    assert '"仍要尝试扫码"' in script
+    assert "重新扫码可能仍会遇到相同验证" in script
+    assert "browserLoginDisplayMessage(result" in script
+    assert "showToast(result?.message" not in script
+    assert "请在官方客户端完成后重新扫码" not in template
+    assert "请在官方客户端完成后重新扫码" not in script
+
+    assert ".manual-login-disclosure.is-recommended" in styles
+    assert ".manual-login-recommendation" in styles
+    assert '.browser-login-visual[data-state="challenge"]' in styles
+
+
+def test_web_cookie_import_has_safe_five_step_guidance() -> None:
+    root = Path(__file__).resolve().parents[2]
+    template = (root / "src/xhs_insight/web/templates/index.html").read_text(
+        encoding="utf-8"
+    )
+    script = (root / "src/xhs_insight/web/static/app.js").read_text(
+        encoding="utf-8"
+    )
+    styles = (root / "src/xhs_insight/web/static/styles.css").read_text(
+        encoding="utf-8"
+    )
+
+    assert '<details class="help-disclosure" open>' in template
+    assert "5 步安全导入方法" in template
+    guide = template[
+        template.index('<ol class="auth-guide-steps">') : template.index(
+            "</ol>", template.index('<ol class="auth-guide-steps">')
+        )
+    ]
+    assert guide.count("<li>") == 5
+    assert "打开开发者工具" in guide
+    assert "<kbd>F12</kbd>" in guide
+    assert "<kbd>⌥⌘I</kbd>" in guide
+    assert "Network" in guide
+    assert "确认录制圆点为红色" in guide
+    assert "/api/sns/web/v2/user/me" in guide
+    assert "user/me" in guide
+    assert "Headers" in guide
+    assert "Request Headers" in guide
+    assert "Cookie:" in guide
+    assert "复制冒号之后的完整值" in guide
+    assert "document.cookie" in guide
+    assert "Copy as cURL" in guide
+    assert "不要复制整块 Request Headers" in guide
+    assert "覆盖系统剪贴板" in guide
+    assert "小红书" not in guide
+    assert "采集" not in guide
+
+    assert template.index('<div class="auth-guide">') < template.index(
+        '<form id="login-form"'
+    )
+    auth_guide = template[
+        template.index('<div class="auth-guide">') : template.index(
+            '<form id="login-form"'
+        )
+    ]
+    assert 'target="_blank" rel="noopener noreferrer"' in auth_guide
+    assert "打开官方网页" in auth_guide
+    assert "完成全部验证" in auth_guide
+    assert '<details class="troubleshooting-disclosure">' in auth_guide
+
+    assert "navigator.clipboard" not in script
+    assert "localStorage" not in script
+    assert "sessionStorage" not in script
+    assert "输入框已清空。请复制一段普通文字覆盖系统剪贴板" in script
+    assert ".auth-guide-steps" in styles
+    assert "min-height: 44px" in styles
 
 
 def test_web_polish_keeps_polling_stable_accessible_and_cache_safe() -> None:

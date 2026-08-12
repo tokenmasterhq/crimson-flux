@@ -410,6 +410,7 @@ def login(
                     while str(result.get("status") or "") in {
                         "starting",
                         "awaiting_scan",
+                        "awaiting_phone_confirmation",
                         "verifying",
                     }:
                         status = str(result.get("status") or "")

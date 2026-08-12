@@ -15,7 +15,9 @@ from xhs_insight.platform import (
     RedNoteClient,
     RedNoteProtocolError,
     TransportResponse,
+    XhshowSigner,
 )
+from xhs_insight.platform import client as platform_client
 
 
 class FakeSigner:
@@ -119,12 +121,10 @@ def test_direct_qr_flow_merges_cookies_and_replaces_visitor_session() -> None:
         ok({"codeStatus": 1}),
         ok(
             {
-                "code_status": 2,
-                "login_info": {
-                    "session": "formal-session",
-                    "secure_session": "secure-session",
-                },
-            }
+                "accepted": True,
+            },
+            web_session="formal-session",
+            web_session_sec="secure-session",
         ),
         ok({"guest": False, "user_id": "user-1"}),
     )
@@ -152,9 +152,148 @@ def test_direct_qr_flow_merges_cookies_and_replaces_visitor_session() -> None:
     ]
     assert transport.requests[2]["headers"]["service-tag"] == "webcn"
     assert transport.requests[3]["headers"]["x-login-mode"] == ""
-    assert {
-        request["max_response_bytes"] for request in transport.requests
-    } == {256 * 1024}
+    assert {request["max_response_bytes"] for request in transport.requests} == {256 * 1024}
+
+
+def test_xhshow_signer_keeps_one_fingerprint_across_qr_flow(monkeypatch: Any) -> None:
+    class PublicConfig:
+        PUBLIC_USERAGENT = "fixture-agent"
+
+    class PublicSessionManager:
+        def __init__(self, _config: PublicConfig) -> None:
+            pass
+
+    class PublicXhshow:
+        def __init__(self, _config: PublicConfig) -> None:
+            self.counter = 0
+
+        @staticmethod
+        def generate_a1() -> str:
+            return "a" * 52
+
+        @staticmethod
+        def generate_web_id(_a1: str) -> str:
+            return "b" * 32
+
+        @staticmethod
+        def build_url(path: str, params: Mapping[str, Any]) -> str:
+            return path if not params else f"{path}?{urlencode(params, doseq=True)}"
+
+        def _headers(self) -> Mapping[str, str]:
+            self.counter += 1
+            return {
+                "x-s": f"signature-{self.counter}",
+                "x-s-common": f"fingerprint-{self.counter}",
+                "x-t": str(self.counter),
+            }
+
+        def sign_headers_get(self, *_args: Any, **_kwargs: Any) -> Mapping[str, str]:
+            return self._headers()
+
+        def sign_headers_post(self, *_args: Any, **_kwargs: Any) -> Mapping[str, str]:
+            return self._headers()
+
+    monkeypatch.setattr(platform_client.xhshow, "CryptoConfig", PublicConfig)
+    monkeypatch.setattr(platform_client.xhshow, "SessionManager", PublicSessionManager)
+    monkeypatch.setattr(platform_client.xhshow, "Xhshow", PublicXhshow)
+
+    transport = FakeTransport(
+        ok({"session": "visitor-session"}),
+        ok(
+            {
+                "qr_id": "qr-id",
+                "code": "qr-code",
+                "url": "https://www.xiaohongshu.com/mobile/login?fixture=1",
+            }
+        ),
+        ok({"codeStatus": 2}),
+        ok(
+            {
+                "code_status": 2,
+                "login_info": {"session": "formal-session"},
+            }
+        ),
+    )
+    client = RedNoteClient.visitor(transport=transport, signer=XhshowSigner())
+
+    client.login_activate()
+    client.create_qr()
+    client.poll_qr("qr-id", "qr-code")
+    client.complete_qr("qr-id", "qr-code")
+
+    request_headers = [request["headers"] for request in transport.requests]
+    assert [headers["x-s-common"] for headers in request_headers] == [
+        "fingerprint-1",
+        "fingerprint-1",
+        "fingerprint-1",
+        "fingerprint-1",
+    ]
+    assert [headers["x-s"] for headers in request_headers] == [
+        "signature-1",
+        "signature-2",
+        "signature-3",
+        "signature-4",
+    ]
+    assert [headers["x-t"] for headers in request_headers] == ["1", "2", "3", "4"]
+
+
+def test_qr_poll_can_install_formal_cookie_before_identity_check() -> None:
+    transport = FakeTransport(
+        ok({"session": "visitor-session"}),
+        ok(
+            {
+                "qr_id": "qr-id",
+                "code": "qr-code",
+                "url": "https://www.xiaohongshu.com/mobile/login?fixture=1",
+            }
+        ),
+        ok({"codeStatus": 2}, web_session="formal-session"),
+        ok({"guest": False, "user_id": "user-1"}),
+    )
+    client = RedNoteClient.visitor(transport=transport, signer=FakeSigner())
+
+    client.login_activate()
+    client.create_qr()
+    poll = client.poll_qr("qr-id", "qr-code")
+
+    assert poll == {"codeStatus": 2}
+    assert client.cookies["web_session"] == "formal-session"
+    assert client.get_user_me() == {"guest": False, "user_id": "user-1"}
+    assert len(transport.requests) == 4
+
+
+def test_qr_challenge_retains_safe_set_cookie_without_reflecting_secrets() -> None:
+    formal_session = "formal-secret-session-from-challenge"
+    raw_message = "challenge body includes private QR token and verifyuuid"
+    response = TransportResponse(
+        471,
+        {"success": False, "msg": raw_message},
+        {"web_session": formal_session},
+    )
+    transport = FakeTransport(response)
+    client = RedNoteClient(
+        "a1=fixture-a1; webId=fixture-web; web_session=visitor-session",
+        transport=transport,
+        signer=FakeSigner(),
+    )
+
+    with pytest.raises(RedNoteProtocolError) as captured:
+        client.poll_qr("private-qr-id", "private-qr-code")
+
+    assert captured.value.kind == FailureKind.RISK_CONTROL
+    assert captured.value.status_code == 471
+    assert client.cookies["web_session"] == formal_session
+    for public_repr in (
+        str(captured.value),
+        repr(captured.value),
+        repr(client),
+        repr(client.cookies),
+        repr(response),
+    ):
+        assert formal_session not in public_repr
+        assert raw_message not in public_repr
+        assert "private-qr-id" not in public_repr
+        assert "private-qr-code" not in public_repr
 
 
 def test_collection_uses_endpoint_specific_signature_modes() -> None:
@@ -242,23 +381,15 @@ def test_upstream_error_never_reflects_response_message_or_cookie() -> None:
     assert secret not in repr(captured.value)
 
 
-def test_qr_completion_rejects_unchanged_visitor_session() -> None:
-    transport = FakeTransport(
-        ok(
-            {
-                "code_status": 2,
-                "login_info": {"session": "visitor-session"},
-            }
-        )
-    )
+def test_qr_completion_accepts_any_success_mapping_and_relies_on_response_cookies() -> None:
+    transport = FakeTransport(ok({"accepted": True}, web_session="formal-session"))
     client = RedNoteClient(
         "a1=fixture-a1; webId=fixture-web; web_session=visitor-session",
         transport=transport,
         signer=FakeSigner(),
     )
-    with pytest.raises(RedNoteProtocolError) as captured:
-        client.complete_qr("qr-id", "qr-code")
-    assert captured.value.kind == FailureKind.SCHEMA
+    assert client.complete_qr("qr-id", "qr-code") == {"accepted": True}
+    assert client.cookies["web_session"] == "formal-session"
 
 
 def test_close_erases_cookie_state_and_closes_transport() -> None:
@@ -386,9 +517,7 @@ def test_http_transport_bounds_decompressed_json_and_parses_retry_after() -> Non
         )
 
     transport._client.close()
-    transport._client = httpx.Client(
-        transport=httpx.MockTransport(retry_response), trust_env=False
-    )
+    transport._client = httpx.Client(transport=httpx.MockTransport(retry_response), trust_env=False)
     response = transport.request_json(
         "GET",
         "https://edith.xiaohongshu.com/api/sns/web/v2/user/me",

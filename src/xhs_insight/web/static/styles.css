@@ -881,7 +881,8 @@ summary:focus-visible,
 }
 
 .browser-login-visual[data-state="error"] .qr-placeholder-icon,
-.browser-login-visual[data-state="expired"] .qr-placeholder-icon {
+.browser-login-visual[data-state="expired"] .qr-placeholder-icon,
+.browser-login-visual[data-state="challenge"] .qr-placeholder-icon {
   background: var(--danger-soft);
   color: var(--danger);
 }
@@ -1046,6 +1047,20 @@ summary:focus-visible,
   border-radius: 16px;
   background: var(--surface-subtle);
   box-shadow: 0 0 0 1px var(--line);
+  transition-property: background-color, box-shadow;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
+}
+
+.manual-login-disclosure.is-recommended {
+  background: var(--accent-faint);
+  box-shadow:
+    0 0 0 1px rgb(255 36 66 / 46%),
+    0 14px 30px -24px rgb(255 36 66 / 42%);
+}
+
+.manual-login-disclosure.is-recommended > summary {
+  color: var(--accent-text);
 }
 
 .manual-login-disclosure > summary {
@@ -1094,6 +1109,48 @@ summary:focus-visible,
   rotate: 180deg;
 }
 
+.manual-login-recommendation {
+  display: flex;
+  gap: 11px;
+  align-items: flex-start;
+  margin: 0 14px 14px;
+  padding: 13px 14px;
+  border-radius: 13px;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgb(255 36 66 / 20%);
+  color: var(--accent-text);
+}
+
+.manual-login-recommendation > .icon {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  margin-top: 1px;
+  stroke-width: 1.5;
+}
+
+.manual-login-recommendation p {
+  margin: 0;
+}
+
+.manual-login-recommendation strong,
+.manual-login-recommendation span {
+  display: block;
+}
+
+.manual-login-recommendation strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.manual-login-recommendation span {
+  margin-top: 4px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+
 .manual-login-content {
   display: grid;
   grid-template-columns: minmax(300px, 0.9fr) minmax(0, 1.1fr);
@@ -1104,6 +1161,11 @@ summary:focus-visible,
 .manual-login-content .auth-import-form,
 .manual-login-content .auth-guide {
   grid-area: auto;
+}
+
+.manual-login-content .auth-import-form {
+  align-self: start;
+  justify-content: flex-start;
 }
 
 .auth-layout {
@@ -1172,10 +1234,25 @@ summary:focus-visible,
   align-items: center;
   justify-content: space-between;
   min-height: 44px;
+  border-radius: 10px;
   color: var(--ink);
   font-size: 12px;
   font-weight: 680;
+  cursor: pointer;
   list-style: none;
+  transition-property: color, background-color;
+  transition-duration: 140ms;
+  transition-timing-function: ease-out;
+}
+
+.help-disclosure summary:hover {
+  color: var(--accent-text);
+  background: rgb(255 255 255 / 72%);
+}
+
+.help-disclosure summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .help-disclosure summary::-webkit-details-marker {
@@ -1191,14 +1268,173 @@ summary:focus-visible,
   rotate: 180deg;
 }
 
-.help-disclosure ol {
+.auth-guide-steps {
+  counter-reset: auth-guide-step;
   display: grid;
-  gap: 8px;
+  gap: 9px;
   margin: 0 0 15px;
-  padding-left: 21px;
+  padding: 0;
   color: var(--ink-soft);
-  font-size: 11px;
-  line-height: 1.65;
+  list-style: none;
+}
+
+.auth-guide-steps li {
+  counter-increment: auth-guide-step;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 10px;
+  border-radius: 12px;
+  background: rgb(255 255 255 / 72%);
+  box-shadow: 0 0 0 1px rgb(25 20 20 / 6%);
+}
+
+.auth-guide-steps li::before {
+  content: counter(auth-guide-step, decimal-leading-zero);
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--accent-faint);
+  color: var(--accent-text);
+  font-size: 12px;
+  font-weight: 760;
+  font-variant-numeric: tabular-nums;
+}
+
+.auth-guide-steps li > div {
+  min-width: 0;
+}
+
+.auth-guide-steps strong {
+  display: block;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.auth-guide-steps p {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+
+.auth-guide-steps code,
+.auth-guide-steps kbd {
+  padding: 1px 4px;
+  border-radius: 5px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.auth-guide-steps kbd {
+  box-shadow: 0 1px 0 rgb(25 20 20 / 14%);
+  white-space: nowrap;
+}
+
+.auth-guide-steps .guide-caution {
+  color: var(--accent-text);
+}
+
+.guide-open-link {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  margin-top: 14px;
+  padding: 0 11px;
+  border-radius: 10px;
+  background: var(--accent-faint);
+  box-shadow: 0 0 0 1px rgb(255 36 66 / 18%);
+  color: var(--accent-text);
+  font-size: 12px;
+  font-weight: 680;
+  text-decoration: none;
+  transition-property: color, background-color, box-shadow, transform;
+  transition-duration: 140ms;
+  transition-timing-function: ease-out;
+}
+
+.guide-open-link:hover {
+  background: #fff;
+  box-shadow: 0 0 0 1px rgb(255 36 66 / 38%);
+}
+
+.guide-open-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.guide-open-link:active {
+  transform: scale(0.96);
+}
+
+.guide-open-link .icon {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.5;
+}
+
+.troubleshooting-disclosure {
+  border-top: 1px solid var(--line);
+}
+
+.troubleshooting-disclosure summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 44px;
+  border-radius: 10px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  font-weight: 680;
+  cursor: pointer;
+  list-style: none;
+}
+
+.troubleshooting-disclosure summary::-webkit-details-marker {
+  display: none;
+}
+
+.troubleshooting-disclosure summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.troubleshooting-disclosure summary .icon {
+  color: var(--ink-faint);
+  transition: rotate 160ms ease-out;
+}
+
+.troubleshooting-disclosure[open] summary .icon {
+  rotate: 180deg;
+}
+
+.troubleshooting-disclosure ul {
+  display: grid;
+  gap: 7px;
+  margin: 0 0 12px;
+  padding-left: 20px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.troubleshooting-disclosure code {
+  padding: 1px 4px;
+  border-radius: 5px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .security-note {
