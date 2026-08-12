@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from scan_release import _scan_payload, scan_g1_tree, scan_git_history  # noqa: E402
+from verify_g1 import _direct_qr_check  # noqa: E402
 
 _RETIRED_ROOT = "third" + "_party"
 _RETIRED_PROJECT = "Spider" + "_XHS"
@@ -72,6 +73,72 @@ def test_direct_qr_module_cannot_spawn_processes() -> None:
     findings = _scan_payload(PurePosixPath("src/xhs_insight/browser_login.py"), source)
 
     assert any("direct QR module may not spawn processes" in finding.reason for finding in findings)
+
+
+def test_direct_qr_g1_contract_preserves_cookie_and_identity_ordering(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "src" / "xhs_insight"
+    platform = package / "platform"
+    platform.mkdir(parents=True)
+    browser = package / "browser_login.py"
+    client = platform / "client.py"
+    browser.write_text(
+        """
+class DirectQrClient: ...
+class DirectQrLoginManager:
+    def _run(self):
+        if not _is_verified_identity(identity):
+            raise RuntimeError
+        result = self._import_cookie(cookie_text)
+
+def _is_verified_identity(value):
+    return value.get(\"guest\") is False and bool(str(value.get(\"user_id\") or \"\").strip())
+
+BrowserLoginManager = DirectQrLoginManager
+qrcode.QRCode()
+""",
+        encoding="utf-8",
+    )
+    client.write_text(
+        """
+import xhshow
+SEARCH_ORIGIN = \"https://so.xiaohongshu.com\"
+_MAX_LOGIN_RESPONSE_BYTES = 256 * 1024
+_MAX_COLLECTION_RESPONSE_BYTES = 4 * 1024 * 1024
+
+class RedNoteClient:
+    def _request(self):
+        self._merge_cookies(response.cookies)
+        self._classify_response(response, operation)
+
+    def login_activate(self): ...
+""",
+        encoding="utf-8",
+    )
+
+    detail = _direct_qr_check(tmp_path)["detail"]
+    assert detail["response_cookies_before_classification"] is True
+    assert detail["verified_nonguest_identity"] is True
+    assert detail["identity_verified_before_import"] is True
+
+    source = client.read_text(encoding="utf-8")
+    client.write_text(
+        source.replace(
+            "        self._merge_cookies(response.cookies)\n"
+            "        self._classify_response(response, operation)",
+            "        self._classify_response(response, operation)\n"
+            "        self._merge_cookies(response.cookies)",
+        ),
+        encoding="utf-8",
+    )
+
+    assert (
+        _direct_qr_check(tmp_path)["detail"][
+            "response_cookies_before_classification"
+        ]
+        is False
+    )
 
 
 def test_full_tree_scan_rejects_non_release_dynamic_js(tmp_path: Path) -> None:

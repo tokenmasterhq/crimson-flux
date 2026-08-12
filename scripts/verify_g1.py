@@ -126,6 +126,24 @@ def _direct_qr_check(root: Path) -> dict[str, Any]:
     browser = browser_path.read_bytes()
     client = client_path.read_bytes()
     combined = browser + b"\n" + client
+    request_start = client.find(b"    def _request(")
+    request_end = client.find(b"    def login_activate(", request_start)
+    request_body = (
+        client[request_start:request_end]
+        if request_start >= 0 and request_end > request_start
+        else b""
+    )
+    merge_index = request_body.find(b"self._merge_cookies(response.cookies)")
+    classify_index = request_body.find(b"self._classify_response(response, operation)")
+    run_start = browser.find(b"    def _run(")
+    run_end = browser.find(b"\n\nBrowserLoginManager =", run_start)
+    run_body = (
+        browser[run_start:run_end]
+        if run_start >= 0 and run_end > run_start
+        else b""
+    )
+    identity_gate_index = run_body.find(b"if not _is_verified_identity(identity):")
+    import_index = run_body.find(b"result = self._import_cookie(")
     required = {
         "direct_client": b"class DirectQrClient" in browser,
         "manager": b"class DirectQrLoginManager" in browser,
@@ -133,8 +151,16 @@ def _direct_qr_check(root: Path) -> dict[str, Any]:
         "bounded_collection_json": (
             b"_MAX_COLLECTION_RESPONSE_BYTES = 4 * 1024 * 1024" in client
         ),
-        "formal_session": b'self._cookies["web_session"] = formal_session' in client,
-        "nonguest": b'identity.get("guest") is not False' in browser,
+        "response_cookies_before_classification": (
+            merge_index >= 0 and classify_index > merge_index
+        ),
+        "verified_nonguest_identity": (
+            b'return value.get("guest") is False '
+            b'and bool(str(value.get("user_id") or "").strip())' in browser
+        ),
+        "identity_verified_before_import": (
+            identity_gate_index >= 0 and import_index > identity_gate_index
+        ),
         "local_png": b"qrcode.QRCode(" in browser,
         "fixed_signer_import": b"import xhshow" in client,
         "fixed_search_origin": b'SEARCH_ORIGIN = "https://so.xiaohongshu.com"' in client,
