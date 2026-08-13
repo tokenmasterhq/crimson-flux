@@ -15,7 +15,7 @@ from xhs_insight.domain import ContentSelection, FieldGroup
 from xhs_insight.security import redact_text, sanitize_url
 from xhs_insight.storage import Repository
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"
 
 CORE_COLUMNS = [
     "schema_version",
@@ -43,6 +43,15 @@ GROUP_COLUMNS: dict[FieldGroup, list[str]] = {
         "share_count",
     ],
     FieldGroup.MEDIA: ["image_count", "image_urls", "has_video", "video_url"],
+}
+
+# The CSV is the human-facing table. Job-level and pagination metadata lives in
+# manifest.json, while JSONL keeps the full normalized record for automation.
+CSV_LEADING_COLUMNS = ["title", "note_url", "note_type", "note_id"]
+CSV_TRAILING_COLUMNS = ["collected_at", "detail_status", "detail_error_code"]
+CSV_GROUP_COLUMNS: dict[FieldGroup, list[str]] = {
+    **GROUP_COLUMNS,
+    FieldGroup.AUTHOR: ["author_name", "author_profile_url", "author_id"],
 }
 
 
@@ -162,6 +171,17 @@ def selected_columns(content: ContentSelection) -> list[str]:
     return columns
 
 
+def selected_csv_columns(content: ContentSelection) -> list[str]:
+    """Return a compact, human-facing table without repeated task metadata."""
+
+    columns = list(CSV_LEADING_COLUMNS)
+    for group in FieldGroup:
+        if group in content.fields:
+            columns.extend(CSV_GROUP_COLUMNS[group])
+    columns.extend(CSV_TRAILING_COLUMNS)
+    return columns
+
+
 def _csv_value(value: Any) -> Any:
     if value is None:
         return ""
@@ -192,6 +212,7 @@ class Exporter:
         job = self.repository.require_job(job_id)
         content = ContentSelection.model_validate(job["content"])
         columns = selected_columns(content)
+        csv_columns = selected_csv_columns(content)
         notes = self.repository.list_notes(job_id)
         records = [_normalize_record(job, note) for note in notes]
         target = self.export_root / job_id
@@ -204,10 +225,16 @@ class Exporter:
         manifest_temp = target / ".manifest.json.tmp"
 
         with csv_temp.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=csv_columns,
+                extrasaction="ignore",
+            )
             writer.writeheader()
             for record in records:
-                writer.writerow({key: _csv_value(record.get(key)) for key in columns})
+                writer.writerow(
+                    {key: _csv_value(record.get(key)) for key in csv_columns}
+                )
             handle.flush()
             os.fsync(handle.fileno())
 
@@ -234,6 +261,7 @@ class Exporter:
                 "preset": content.preset.value,
                 "fields": sorted(field.value for field in content.fields),
                 "columns": columns,
+                "csv_columns": csv_columns,
             },
             "scope": {
                 "enumeration_complete": job["enumeration_complete"],

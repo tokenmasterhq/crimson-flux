@@ -107,14 +107,27 @@ _BROWSER_AUTOMATION_RE = re.compile(
     rb"(?:"
     rb"--remote-debugging-(?:address|port)|--user-data-dir|DevToolsActivePort"
     rb"|/devtools/(?:browser|page)/|/json/(?:list|version)\b"
+    rb"|\b(?:Target\.(?:getTargets|attachToTarget)|Network\.getCookies)\b"
     rb"|(?:google-chrome(?:-stable)?|chromium(?:-browser)?|msedge(?:\.exe)?|chrome\.exe)"
+    rb")",
+    re.IGNORECASE,
+)
+_FORBIDDEN_CANONICAL_BROWSER_RE = re.compile(
+    rb"(?:"
+    rb"\bRuntime\s*\.\s*(?:evaluate|callFunctionOn)\b"
+    rb"|\b(?:Network|Fetch)\s*\.\s*getResponseBody\b"
+    rb"|\b(?:Storage\s*\.\s*getCookies|Network\s*\.\s*getAllCookies)\b"
+    rb"|\b(?:localStorage|sessionStorage)\b"
+    rb"|--no-sandbox\b"
+    rb"|--disable-web-security\b"
+    rb"|--remote-allow-origins\s*=\s*\*"
     rb")",
     re.IGNORECASE,
 )
 _DYNAMIC_BRIDGES = frozenset(
     {"execjs", "js2py", "playwright", "py_mini_racer", "pyppeteer", "selenium"}
 )
-_CANONICAL_DIRECT_QR_LOGIN = PurePosixPath("src/xhs_insight/browser_login.py")
+_CANONICAL_BROWSER_LOGIN = PurePosixPath("src/xhs_insight/browser_login.py")
 _HISTORICAL_DISCLOSURE_PATHS = frozenset(
     {
         "README.md",
@@ -209,7 +222,7 @@ def required_release_paths() -> frozenset[str]:
             "scripts/doctor.py",
             "scripts/scan_release.py",
             "scripts/verify_g1.py",
-            _CANONICAL_DIRECT_QR_LOGIN.as_posix(),
+            _CANONICAL_BROWSER_LOGIN.as_posix(),
         }
     )
     return frozenset(required)
@@ -261,23 +274,29 @@ def _python_security_findings(relative: PurePosixPath, payload: bytes) -> list[F
                 findings.append(Finding(path, f"dynamic Python execution primitive: {name}"))
                 break
 
-    if relative == _CANONICAL_DIRECT_QR_LOGIN:
-        if "subprocess" in imported_roots or "websocket" in imported_roots:
-            findings.append(Finding(path, "direct QR module may not spawn processes or use WebSockets"))
+    if relative == _CANONICAL_BROWSER_LOGIN:
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            names = {
-                candidate.id
-                for candidate in ast.walk(node)
-                if isinstance(candidate, ast.Name)
-            }
-            if "program_text" not in names:
-                continue
             call_name = _qualified_name(node.func) or ""
-            if call_name not in {"len", "str", "_GETDSS_RE.search"}:
-                findings.append(Finding(path, "remote program text reaches an unapproved call"))
+            if call_name in {"os.system", "os.popen"}:
+                findings.append(Finding(path, "canonical browser login uses a shell launcher"))
                 break
+            if call_name in {"subprocess.Popen", "subprocess.run", "subprocess.call"}:
+                shell_keywords = [
+                    keyword
+                    for keyword in node.keywords
+                    if keyword.arg == "shell"
+                    and not (
+                        isinstance(keyword.value, ast.Constant)
+                        and keyword.value.value is False
+                    )
+                ]
+                if shell_keywords:
+                    findings.append(
+                        Finding(path, "canonical browser login may not enable subprocess shell")
+                    )
+                    break
     return findings
 
 
@@ -295,8 +314,14 @@ def _scan_payload(relative: PurePosixPath, payload: bytes) -> list[Finding]:
     suffix = relative.suffix.casefold()
     if suffix in {".cjs", ".js", ".mjs"} and _DYNAMIC_JS_RE.search(payload):
         findings.append(Finding(path, "dynamic JavaScript execution primitive"))
-    if relative.parts[:2] == ("src", "xhs_insight") and _BROWSER_AUTOMATION_RE.search(payload):
+    if (
+        relative.parts[:2] == ("src", "xhs_insight")
+        and relative != _CANONICAL_BROWSER_LOGIN
+        and _BROWSER_AUTOMATION_RE.search(payload)
+    ):
         findings.append(Finding(path, "browser automation or debugging transport marker"))
+    if relative == _CANONICAL_BROWSER_LOGIN and _FORBIDDEN_CANONICAL_BROWSER_RE.search(payload):
+        findings.append(Finding(path, "unsafe browser or CDP capability in canonical login module"))
     if suffix == ".py":
         findings.extend(_python_security_findings(relative, payload))
     return findings

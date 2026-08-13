@@ -13,6 +13,9 @@ _REVISION = "0123456789abcdef"
 
 
 class _QrManager:
+    def capability(self) -> dict[str, Any]:
+        return {"browser_login_embedded_qr": True}
+
     def qr_image(self) -> tuple[bytes, str]:
         return _QR_PNG, _REVISION
 
@@ -110,3 +113,29 @@ def test_embedded_qr_route_does_not_serialize_manager_state(tmp_path: Path) -> N
         "secpoisonid",
     ):
         assert marker not in lowered_headers
+
+
+def test_isolated_browser_mode_disables_legacy_qr_response(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    backend: Any = _Backend(settings)
+
+    class DisabledQrManager:
+        def capability(self) -> dict[str, Any]:
+            return {"browser_login_embedded_qr": False}
+
+        def qr_image(self) -> tuple[bytes, str]:
+            raise AssertionError("disabled QR endpoint must not ask the manager for an image")
+
+    backend.browser_login = DisabledQrManager()
+    app = create_app(settings, backend=backend)
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        assert client.get("/").status_code == 200
+        response = client.get("/api/v1/auth/browser/qr")
+
+    assert response.status_code == 410
+    assert response.json()["detail"] == {
+        "code": "EMBEDDED_QR_DISABLED",
+        "message": "页面内二维码已停用；请使用隔离的官方网页登录窗口。",
+        "retryable": False,
+    }

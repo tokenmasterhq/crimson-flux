@@ -1,97 +1,96 @@
-# G1：固定 Python 签名与页面内扫码边界
+# G1：隔离可见浏览器登录与固定 Python 签名边界
 
 ## 目标
 
-G1 要证明 CrimsonFlux 的登录和采集路径只运行随发行版锁定、可审计的 Python 代码，不执行平台响应中的程序文本，不启动浏览器自动化，也不存在不安全回退。
+CrimsonFlux 为降低普通用户取得 Cookie 的门槛，会启动一个**临时、隔离、可见**的官方网页登录窗口。用户只在该窗口内扫码及完成平台可能要求的短信验证；应用随后通过最小 CDP 接口读取指定官方 URL 可用的 Cookie，并交给既有 `/user/me` 校验路径。校验成功前不会持久化任何凭证。
 
-签名能力来自直接依赖 `xhshow==0.2.0`。应用在 Python 进程内调用其公开签名 API；依赖由 `uv.lock` 和带哈希的 `requirements.lock` 固定。仓库不包含任何第三方采集器源码或签名脚本副本。
+G1 要证明这条便利路径不会控制用户日常浏览器资料、执行页面脚本、读取页面内容、扩大 Cookie 范围或留下调试入口。签名仍只使用发行版锁定的 Python 代码与 `xhshow==0.2.0`；页面响应中的程序文本始终是不可信数据。
 
-机器检查通过不等于发布审批通过。独立安全 reviewer、真实低频扫码 smoke 和发布负责人审批仍是必需条件。
+机器检查通过不等于发布审批通过。独立安全 reviewer、真实低频 smoke 和发布负责人审批仍是必需条件。
 
-## 数据流
+## 固定数据流
 
 ```text
-固定 HTTPS 登录接口
-        │
-        ├─ 有界响应；未知字段按不可信数据处理
-        └─ 响应中的 program/script 文本不得执行、保存或转发
+用户点击“打开登录窗口”
         ▼
-固定 Python 请求构造 + xhshow 0.2.0 本地签名
+从固定操作系统 allowlist 选择 Chrome / Edge / Chromium
         ▼
-qrcode/create → 校验 QR URL → 内存生成 PNG → 同源 no-store 图片 API
+创建权限 0700 的随机临时 Profile
         ▼
-userinfo / qrcode/status 有界轮询
-        │
-        ├─ code_status 必须为成功状态
-        └─ 正式 session 必须非空且不同于 visitor session
+固定 argv 启动可见窗口
+  ├─ 固定官方 URL：https://www.xiaohongshu.com/explore
+  ├─ CDP：127.0.0.1 + 随机端口
+  └─ 不复用默认 Profile，不使用 shell，不接受自定义 flags / executable
         ▼
-/user/me：success=true 且 guest=false
+最小 CDP：Target.getTargets / attachToTarget / Network.enable
         ▼
-AES-256-GCM 加密持久化登录态
+Network.getCookies(urls=[固定 /user/me URL])
+  ├─ 只保留 xiaohongshu.com 域 Cookie
+  ├─ 字段、数量和总大小均有界
+  └─ 必须包含 a1 与 web_session
+        ▼
+既有 adapter 使用 Cookie 请求固定 /user/me
+  └─ guest=false 且 user_id 非空
+        ▼
+AES-256-GCM 加密持久化
+        ▼
+关闭 CDP 与浏览器，删除临时 Profile
 ```
 
-二维码 URL 只接受固定的小红书 HTTPS host，不得含端口、用户名或密码。QR value、qr_id、code 和 PNG 只存在于当前登录会话内存；成功、取消、失败、超时或关闭时清除。受保护的 `GET /api/v1/auth/browser/qr` 路径名为兼容旧 API 保留，实际实现不启动或控制浏览器。
+Cookie 的唯一 CDP 查询范围是：
 
-## 固定接口边界
+`https://edith.xiaohongshu.com/api/sns/web/v2/user/me`
 
-登录客户端只允许发布评审中列明的固定小红书 HTTPS endpoint。当前页面内扫码所需核心路径为：
+登录页、Cookie 查询 URL、浏览器候选路径、启动参数和 CDP 方法都由源码常量固定，不能由 UI、环境变量、请求参数或平台响应指定。
 
-- `/api/sns/web/v1/login/qrcode/create`
-- `/api/qrcode/userinfo`
-- `/api/sns/web/v1/login/qrcode/status`
-- `/api/sns/web/v2/user/me`
+## 浏览器进程边界
 
-若登录初始化还需要安全配置 endpoint，其 origin、path、响应大小、超时和可读取字段也必须逐一进入 allowlist。endpoint 不能由 UI、环境变量或平台响应动态指定。
+- 仅允许规范模块 `src/xhs_insight/browser_login.py` 启动或控制浏览器；其他产品模块出现浏览器自动化/CDP 标记即发布阻断。
+- 只从按操作系统审计的 Chrome、Edge、Chromium 固定路径中选择可执行文件；禁止任意路径、PATH 注入、下载浏览器或自定义 executable。
+- 每次登录创建全新的随机临时 `--user-data-dir`，权限为 `0700`；禁止读取、复制或挂载用户默认 Profile。
+- CDP 只监听 `127.0.0.1`，使用浏览器分配的随机端口；严格校验 `DevToolsActivePort` 内容、端口范围和回环调试地址。
+- `subprocess` 只接受固定 argv 列表，`shell=False`，stdout/stderr 丢弃；Cookie 不进入 argv、环境变量、工作目录或输出。
+- 禁止 `--no-sandbox`、`--disable-web-security`、通配 `--remote-allow-origins=*` 以及关闭同源/沙箱保护的参数。
+- Docker、无 GUI 环境或没有 allowlist 浏览器时明确显示“不支持自动登录”，保留用户主动手动导入入口；不得静默降级到不安全启动方式。
 
-轮询默认每 2 秒一次、总计最多 180 秒。平台返回待扫码、待手机确认、成功和过期状态时必须分别显示；429、风控或持续网络错误按产品策略失败或暂停，不得重建设备、轮换代理或提高并发规避限制。
+## 最小 CDP 能力
 
-## Python 签名边界
+允许的方法仅限于建立目标会话及读取指定 URL Cookie 所需集合：
 
-- 只允许导入锁定依赖 `xhshow==0.2.0` 的公开 API；禁止从网络下载模块或运行时代码。
-- Cookie、请求体和协议字段只在进程内传递，不进入 argv、环境变量、临时文件或日志。
-- 每次签名输入和输出都执行类型、长度和字段 allowlist 校验；异常只映射为脱敏错误码。
-- 禁止 `eval`、`exec`、`compile`、`execjs`、`js2py`、浏览器页面执行以及把响应文本传给 subprocess。
-- 禁止运行时 monkey patch、动态 import 路径、未锁定 signer fallback 和从 CDN/平台获取“补丁”。
-- `xhshow` 升级必须重新固定版本与哈希、复核源码差异、更新 notices、跑 golden vectors 和真实低频 smoke。
+- `Target.getTargets`
+- `Target.attachToTarget`
+- `Network.enable`
+- `Network.getCookies`，且参数必须为 `urls=[COOKIE_SOURCE_URL]`
 
-## 登录持久化强制条件
+明确禁止：
 
-匿名 activate 得到的 visitor session 不能直接保存。扫码成功后必须：
+- `Runtime.evaluate`、`Runtime.callFunctionOn` 或任何页面 JavaScript 执行；
+- `Network.getResponseBody`、`Fetch.getResponseBody`、DOM、截图、键盘或表单自动化；
+- `localStorage`、`sessionStorage`、IndexedDB 或浏览历史读取；
+- `Storage.getCookies`、`Network.getAllCookies` 等浏览器全局 Cookie 读取；
+- 任意页面导航、任意 URL Cookie 查询、扩展加载和远程调试端口复用。
 
-1. 调用固定状态接口并验证成功状态；
-2. 取得有界、非空的正式 session，并证明它不同于 visitor session；
-3. 显式替换 `web_session`；
-4. 调用固定 `/user/me`，要求 `success=true` 且 `guest is false`；
-5. 仅在上述步骤全部成功后加密保存 Cookie。
+CDP 消息 ID、method、sessionId、JSON 深度、单条消息和累计输入都有边界；未知事件立即丢弃。状态 API 只返回固定本地状态/错误码，不返回 Cookie、页面 URL、target 信息、Profile 路径、CDP endpoint 或上游原文。
 
-任何顺序变化、跳过 guest 检查、保留 visitor session 或提前持久化都属于发布阻断。
+## 凭证验证与生命周期
 
-## 页面内二维码 API
+自动读取的候选 Cookie 必须经过与手动导入相同的标准化规则：字段名合法、无重复、总长不超过 16 KiB，且包含 `a1` 与 `web_session`。同名 Cookie 按固定域名/路径优先级确定，不接受页面或用户控制的选择逻辑。
 
-`GET /api/v1/auth/browser/qr`：
+候选值仅在内存中交给 `Backend.import_cookie`。`RednoteAdapter.verify_cookie` 必须请求固定 `/user/me`，验证 `guest is false` 和非空 `user_id`；只有验证成功后才允许加密持久化。验证失败、用户取消、超时、窗口关闭、服务关闭或异常时均不得保存候选 Cookie。
 
-- 只返回 `image/png`；
-- 要求本机 Host、同源 Origin 以及本地 Web 会话或 CLI token；
-- 强制 `private, no-store, max-age=0, must-revalidate`、`Pragma: no-cache`、`Expires: 0` 与 `nosniff`；
-- 不返回 QR value、Cookie、签名输入、平台响应、错误原文或调试状态；
-- QR PNG 不写入 SQLite、文件、导出或日志。
+每个终止路径都必须：关闭 CDP socket、终止浏览器；必要时有界等待后 kill；清空进程/端口/会话/Cookie 引用；删除临时 Profile。删除失败必须返回脱敏错误并记录不含路径和凭证的本地错误码，不能把残留 Profile 当作可恢复会话。
 
-Docker 与原生使用同一纯 HTTP 实现，均不需要图形环境或宿主浏览器。
+## 固定 Python 签名边界
 
-## 全树策略与对抗测试
+- 只允许导入锁定依赖 `xhshow==0.2.0` 的公开 API；禁止网络下载模块或运行时代码。
+- Cookie、请求体和签名材料只在进程内传递，不进入 argv、环境变量、临时文件或日志。
+- 禁止 `eval`、`exec`、`compile`、`execjs`、`js2py`、页面执行和把平台响应文本传给 subprocess。
+- 禁止动态 import、未锁定 signer fallback、运行时 patch 和 CDN/平台下发“补丁”。
+- 依赖升级必须重新固定版本与哈希、复核源码差异、更新 notices、跑 golden vectors 与真实低频 smoke。
 
-发布扫描必须覆盖 checkout 全树、Git 可达对象、Source Release 投影、最终 ZIP 与容器上下文，并拒绝：
+## 全树门禁与 Evidence
 
-- 第三方采集器源码、副本、subtree、压缩包或构建残留；
-- JavaScript/浏览器运行时、动态代码执行和网络下载代码路径；
-- Chrome/Chromium/Edge 启动参数、CDP、DevTools endpoint、WebSocket 调试和浏览器 Profile；
-- program/script 写文件、记录日志、返回给调用方、持久化或传给任意执行器；
-- 未评审 endpoint、宽泛字段提取、未丢弃秘密响应和提前持久化；
-- 未锁定签名依赖、备用 signer、运行时 patch 和 symlink 逃逸。
-
-合成响应只存在于测试，不构成演示模式。正则、AST 和秘密扫描都不是形式化证明；evidence 必须记录 release 文件 SHA-256 与 tree digest，源码或锁文件变化会使旧 evidence 失效。
-
-## Evidence
+发布扫描覆盖 checkout 全树、Git 可达对象、Source Release、最终 ZIP 与容器上下文，并拒绝：规范模块外的浏览器自动化；规范模块内的危险 CDP 方法或启动参数；第三方采集器源码；动态代码执行；秘密、状态库、Profile 与构建残留。
 
 生成与验证：
 
@@ -108,13 +107,11 @@ python scripts/verify_g1.py \
   --output dist/g1/g1-container.json
 ```
 
-CI 应保存 Windows、macOS、Linux 和构建镜像证据。
-
 ## 仍需真人完成
 
-- 独立 reviewer 复核从平台响应到签名、二维码与 session 持久化的完整数据流；
-- 逐文件复核 `xhshow==0.2.0` 及 `pycryptodome==3.23.0` 在实际调用路径中的能力边界；
-- 维护者使用授权测试账号低频完成扫码、nonguest 验证与关键词/用户采集 smoke；
-- 确认 QR value、二维码、Cookie、签名输入和平台秘密响应不进入日志、文件或错误文本；
-- 分别验证成功、取消、失败、超时和关闭后的二维码内存清理；
-- 发布负责人核对 evidence 的 commit/tree digest 与三平台/容器结果，创建私有审批记录。
+- 独立 reviewer 复核固定 argv、可执行文件 allowlist、随机回环 CDP 和 Cookie URL scope；
+- 在 Windows、macOS、Linux 支持范围分别确认不会复用默认 Profile；
+- 使用授权测试账号低频完成扫码、可选短信验证、`/user/me` nonguest 与采集 smoke；
+- 对成功、取消、验证失败、超时、窗口关闭和服务退出分别确认进程、CDP 与临时 Profile 已清理；
+- 确认 Cookie、CDP endpoint、Profile 路径、页面内容和平台秘密响应未进入 API、日志、文件或错误文本；
+- 发布负责人核对 evidence 的 commit/tree digest 与三平台/容器结果，并创建私有审批记录。

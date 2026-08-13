@@ -68,8 +68,8 @@ DETAIL_FIELDS = frozenset(
 STATUS_LABELS = {
     "queued": "等待运行",
     "enumerating": "列出笔记",
-    "awaiting_detail_confirmation": "等待详情确认",
-    "fetching_details": "采集详情",
+    "awaiting_detail_confirmation": "等你确认更多信息",
+    "fetching_details": "正在读取更多信息",
     "exporting": "生成文件",
     "completed": "已完成",
     "completed_with_warnings": "完成（有缺失）",
@@ -182,8 +182,8 @@ def _keyword_estimate(limit: int, content: ContentSelection, health: dict[str, A
     minimum = math.ceil(total_requests * pause_min)
     maximum = math.ceil(total_requests * pause_max)
     return (
-        f"预计列表请求约 {list_requests} 次；最多详情请求 {detail_requests} 次；"
-        f"按当前请求间隔估算约 {minimum}–{maximum} 秒（不含网络与限流等待）"
+        f"大约需要查看 {list_requests} 页结果；最多逐条读取 {detail_requests} 项内容；"
+        f"预计约需 {minimum}–{maximum} 秒（网络较慢或平台限制时会更久）"
     )
 
 
@@ -225,7 +225,7 @@ def _print_jobs(items: list[dict[str, Any]]) -> None:
     if not items:
         typer.echo("暂无任务。")
         return
-    typer.echo(f"{'任务 ID':<10}  {'状态':<18}  {'条数':>6}  {'详情':>11}  来源")
+    typer.echo(f"{'任务 ID':<10}  {'状态':<18}  {'条数':>6}  {'更多信息':>11}  来源")
     typer.echo("-" * 82)
     for job in items:
         job_id = _truncate(job.get("id"), 10)
@@ -247,12 +247,23 @@ def _print_job(job: dict[str, Any]) -> None:
     typer.echo(f"任务：{job.get('id', '-')}")
     typer.echo(f"状态：{STATUS_LABELS.get(str(job.get('status')), job.get('status', '-'))}")
     typer.echo(f"来源：{_source_label(job)}")
-    typer.echo(f"字段：{content.get('preset', 'basic')} ({', '.join(fields)})")
+    preset_labels = {"basic": "快速版", "full": "完整版", "custom": "自己选择"}
+    field_labels = {
+        "author": "作者信息",
+        "body": "正文和时间",
+        "tags": "内容标签",
+        "metrics": "点赞收藏评论数",
+        "media": "图片视频链接",
+    }
+    selected = "、".join(field_labels.get(item, item) for item in fields) or "默认信息"
+    typer.echo(
+        f"保存内容：{preset_labels.get(str(content.get('preset')), '快速版')}（{selected}）"
+    )
     typer.echo(
         "进度："
         f"{int(job.get('unique_notes') or 0)} 条；"
-        f"详情成功 {int(job.get('detail_succeeded') or 0)}；"
-        f"详情失败 {int(job.get('detail_failed') or 0)}"
+        f"更多信息已读 {int(job.get('detail_succeeded') or 0)}；"
+        f"未读到 {int(job.get('detail_failed') or 0)}"
     )
     if source.get("type") == "keyword":
         typer.echo(f"目标：{source.get('limit', '-')} 条（实际结果可能少于目标）")
@@ -401,21 +412,19 @@ def login(
                         code="BROWSER_LOGIN_UNAVAILABLE",
                     )
                 result = _as_dict(client.post("/auth/browser", {}))
-                web_url = client.config.api_url.removesuffix("/api/v1") or "http://127.0.0.1:8765"
-                typer.secho("登录二维码已生成。", fg=typer.colors.CYAN)
-                typer.echo(f"请打开 {web_url}，直接扫描页面中的二维码。")
-                typer.echo("本地服务不会读取你的日常浏览器资料。")
+                typer.secho("已打开隔离的官方网页登录窗口。", fg=typer.colors.CYAN)
+                typer.echo("请在该窗口按官方提示完成扫码、确认或短信验证。")
+                typer.echo("完成后会自动连接，并关闭窗口、删除临时浏览器资料。")
                 last_status = ""
                 try:
                     while str(result.get("status") or "") in {
                         "starting",
-                        "awaiting_scan",
-                        "awaiting_phone_confirmation",
+                        "awaiting_login",
                         "verifying",
                     }:
                         status = str(result.get("status") or "")
                         if status != last_status:
-                            typer.echo(str(result.get("message") or "正在等待扫码…"))
+                            typer.echo(str(result.get("message") or "正在等待网页登录…"))
                             last_status = status
                         time.sleep(1)
                         result = _as_dict(client.get("/auth/browser/status"))
@@ -424,10 +433,10 @@ def login(
                     raise typer.Abort() from None
                 if result.get("status") != "succeeded" or result.get("authenticated") is not True:
                     raise ApiError(
-                        str(result.get("message") or "扫码登录未完成。"),
+                        str(result.get("message") or "网页登录未完成。"),
                         code=str(result.get("error_code") or "BROWSER_LOGIN_FAILED"),
                     )
-            typer.secho("扫码登录成功，登录态已加密保存在本机。", fg=typer.colors.GREEN)
+            typer.secho("网页登录成功，登录态已加密保存在本机。", fg=typer.colors.GREEN)
             return
         except (ApiError, ClientConfigurationError) as exc:
             _fail(exc)
@@ -597,7 +606,7 @@ def collect_user(
         typer.Option(
             "--yes",
             "-y",
-            help="确认遍历全部公开笔记；若含详情，也预先确认详情阶段。",
+            help="确认整理全部可见内容；若选择更多信息，也直接确认逐条读取。",
         ),
     ] = False,
 ) -> None:
@@ -705,14 +714,14 @@ def _legacy_jobs(
                         minimum = math.ceil(count * pause_min)
                         maximum = math.ceil(count * pause_max)
                         typer.echo(
-                            f"已发现 {count} 条笔记；最多详情请求 {count} 次；"
+                            f"已发现 {count} 条内容；接下来最多逐条读取 {count} 项；"
                             f"按当前 {pause_min:g}–{pause_max:g} 秒间隔，"
-                            f"详情阶段约需 {minimum}–{maximum} 秒。"
+                            f"预计还需 {minimum}–{maximum} 秒。"
                         )
-                        question = "确认逐条采集所选详情字段？"
+                        question = "确认逐条读取你选择的更多信息？"
                     else:
-                        typer.echo(f"已发现 {count} 条笔记；详情请求 0 次。")
-                        question = "确认跳过详情并仅导出所选基础字段？"
+                        typer.echo(f"已发现 {count} 条内容；不会逐条打开。")
+                        question = "确认直接导出当前结果？"
                 if not yes:
                     if action == "cancel":
                         question = "确定取消任务？已采集的数据不会被删除。"

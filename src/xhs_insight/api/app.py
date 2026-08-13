@@ -22,7 +22,7 @@ from starlette.responses import Response
 
 from xhs_insight import __version__
 from xhs_insight.adapters import AuthManager, RednoteAdapter
-from xhs_insight.browser_login import DirectQrLoginManager
+from xhs_insight.browser_login import IsolatedBrowserLoginManager
 from xhs_insight.config import Settings
 from xhs_insight.exporting import Exporter
 from xhs_insight.jobs import JobService
@@ -78,6 +78,7 @@ class Backend:
         self,
         cookie: str,
         cancelled: Any | None = None,
+        before_persist: Any | None = None,
     ) -> dict[str, Any]:
         """Verify a Cookie against XHS before committing its encrypted state."""
 
@@ -89,6 +90,15 @@ class Backend:
             verified = self.adapter.verify_cookie(cookie)
             # Verification is a network operation. Re-check after it returns so
             # a task queued concurrently cannot have its credential replaced.
+            if self.repository.has_running_or_queued_jobs():
+                raise PermissionError("验证期间已有任务开始运行，登录态未保存")
+            if callable(cancelled) and cancelled():
+                raise PermissionError("扫码登录已取消，登录态未保存")
+            # The isolated browser supplies a cleanup barrier here.  Its CDP
+            # endpoint, process and temporary profile must be gone before the
+            # verified credential can become available to collection jobs.
+            if callable(before_persist):
+                before_persist()
             if self.repository.has_running_or_queued_jobs():
                 raise PermissionError("验证期间已有任务开始运行，登录态未保存")
             if callable(cancelled) and cancelled():
@@ -134,7 +144,7 @@ def create_backend(settings: Settings) -> Backend:
         account_fingerprint=lambda: auth.account_fingerprint,
     )
     backend = Backend(settings, repository, cipher, auth, adapter, exporter, jobs)
-    backend.browser_login = DirectQrLoginManager(
+    backend.browser_login = IsolatedBrowserLoginManager(
         settings.state_dir,
         backend.import_cookie,
         repository.has_running_or_queued_jobs,

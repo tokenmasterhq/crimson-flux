@@ -253,7 +253,7 @@ def test_login_reads_cookie_from_stdin_without_echoing_or_argv_transport(
     assert "验证成功" in result.output
 
 
-def test_login_defaults_to_official_browser_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_login_defaults_to_isolated_official_browser(monkeypatch: pytest.MonkeyPatch) -> None:
     class BrowserLoginClient(FakeClient):
         def __init__(self) -> None:
             super().__init__(health=_health())
@@ -262,7 +262,7 @@ def test_login_defaults_to_official_browser_scan(monkeypatch: pytest.MonkeyPatch
         def post(self, path: str, body: Any = None) -> Any:
             assert path == "/auth/browser"
             assert body == {}
-            return {"status": "awaiting_scan", "message": "请扫码"}
+            return {"status": "awaiting_login", "message": "请在官方窗口完成登录"}
 
         def get(self, path: str) -> Any:
             if path == "/health":
@@ -271,12 +271,9 @@ def test_login_defaults_to_official_browser_scan(monkeypatch: pytest.MonkeyPatch
             self.status_reads += 1
             if self.status_reads == 1:
                 return {
-                    "status": "awaiting_phone_confirmation",
+                    "status": "verifying",
                     "authenticated": False,
-                    "message": (
-                        "已扫码，请按手机提示完成确认；"
-                        "如要求短信验证，请在手机端完成。"
-                    ),
+                    "message": "检测到网页登录状态，正在验证账号…",
                 }
             return {
                 "status": "succeeded",
@@ -292,12 +289,11 @@ def test_login_defaults_to_official_browser_scan(monkeypatch: pytest.MonkeyPatch
 
     assert result.exit_code == 0, result.output
     assert fake.status_reads == 2
-    assert "登录二维码已生成" in result.output
-    assert "http://127.0.0.1:8765" in result.output
-    assert "直接扫描页面中的二维码" in result.output
-    assert "如要求短信验证，请在手机端完成" in result.output
-    assert "官方小红书窗口" not in result.output
-    assert "扫码登录成功" in result.output
+    assert "已打开隔离的官方网页登录窗口" in result.output
+    assert "扫码、确认或短信验证" in result.output
+    assert "自动连接" in result.output
+    assert "删除临时浏览器资料" in result.output
+    assert "网页登录成功" in result.output
 
 
 def test_login_rejects_invalid_cookie_without_calling_api(
@@ -333,9 +329,9 @@ def test_keyword_limit_and_estimate_come_from_health(monkeypatch: pytest.MonkeyP
     )
     assert accepted.exit_code == 0, accepted.output
     assert "请求间隔 7–9 秒" in accepted.output
-    assert "预计列表请求约 1 次" in accepted.output
-    assert "最多详情请求 0 次" in accepted.output
-    assert "估算约 7–9 秒" in accepted.output
+    assert "大约需要查看 1 页结果" in accepted.output
+    assert "最多逐条读取 0 项内容" in accepted.output
+    assert "预计约需 7–9 秒" in accepted.output
     assert fake.posts[0][0] == "/jobs"
 
 
@@ -424,10 +420,10 @@ def test_confirm_details_prompt_states_discovered_count_and_request_maximum(
     )
 
     assert result.exit_code == 0, result.output
-    assert "已发现 37 条笔记" in result.output
-    assert "最多详情请求 37 次" in result.output
+    assert "已发现 37 条内容" in result.output
+    assert "接下来最多逐条读取 37 项" in result.output
     assert "按当前 7–9 秒间隔" in result.output
-    assert "详情阶段约需 259–333 秒" in result.output
+    assert "预计还需 259–333 秒" in result.output
     assert fake.posts[0][0] == "/jobs/job-1/confirm-details"
 
 
@@ -442,13 +438,13 @@ def test_web_contract_has_no_runtime_demo_mode_and_keeps_export_controls() -> No
     assert 'type="password"' in template
     assert 'autocomplete="new-password"' in template
     assert 'id="browser-login"' in template
-    assert "扫码连接平台账号" in template
-    assert "打开一个全新的小红书官方浏览器窗口" not in template
-    assert 'id="browser-login-qr"' in template
-    assert 'alt="平台登录二维码，请使用平台官方 App 扫描"' in template
+    assert "打开官方网页登录" in template
+    assert "独立的临时 Chrome 或 Edge 窗口" in template
+    assert 'id="browser-login-qr"' not in template
+    assert 'id="icon-browser"' in template
     assert 'id="browser-login-countdown"' in template
     assert 'aria-live="polite"' in template
-    assert "二维码在本页完成，不读取日常浏览器资料" in template
+    assert "不会读取你日常浏览器里的账号资料" in template
     assert 'id="export-basic"' in template
     assert 'id="profile-url"' in template
     assert 'autocomplete="off" spellcheck="false"' in template
@@ -456,8 +452,8 @@ def test_web_contract_has_no_runtime_demo_mode_and_keeps_export_controls() -> No
     assert 'elements.profileUrl.value = ""' in script
     assert 'elements.exportBasic.addEventListener("click", exportBasic)' in script
     assert '{ preset: "basic", fields: [] }' in script
-    assert "预计列表请求约 ${requests.listRequests} 次" in script
-    assert "最多发起 ${count} 次详情请求" in script
+    assert "大约需要查看 ${requests.listRequests} 页结果" in script
+    assert "接下来最多逐条读取 ${count} 项内容" in script
     assert "fixtureMode" not in script
     assert "离线演示" not in script
     assert "小红书" not in template
@@ -471,25 +467,22 @@ def test_web_contract_has_no_runtime_demo_mode_and_keeps_export_controls() -> No
     assert 'api("/auth/import"' in script
     assert 'api("/auth/browser"' in script
     assert 'api("/auth/browser/status")' in script
-    assert "`${API_BASE}/auth/browser/qr`" in script
-    assert 'response.headers.get("x-xhs-qr-revision")' in script
-    assert "state.browserQrRevision !== nextQrRevision" in script
-    assert 'cache: "no-store"' in script
+    assert "/auth/browser/qr" not in script
+    assert "browserQr" not in script
     assert "/auth/qr" not in script
-    assert 'awaiting_phone_confirmation: "等待手机确认"' in script
-    assert "已扫码，请按手机提示完成确认；如要求短信验证，请在手机端完成。" in script
-    assert 'status === "awaiting_phone_confirmation"' in script
+    assert 'awaiting_login: "等待网页登录"' in script
+    assert "请在弹出的官方窗口完成登录" in script
     browser_active_statuses = script[
         script.index("const BROWSER_LOGIN_ACTIVE") : script.index(
             "const BROWSER_LOGIN_LABELS"
         )
     ]
-    assert '"awaiting_phone_confirmation"' in browser_active_statuses
+    assert '"awaiting_login"' in browser_active_statuses
     assert "browser-verification" not in template
     assert "/auth/browser/verification" not in script
 
 
-def test_web_platform_challenge_recommends_cookie_fallback_without_retry_loop() -> None:
+def test_web_browser_failure_recommends_manual_login_fallback() -> None:
     root = Path(__file__).resolve().parents[2]
     template = (root / "src/xhs_insight/web/templates/index.html").read_text(
         encoding="utf-8"
@@ -503,31 +496,28 @@ def test_web_platform_challenge_recommends_cookie_fallback_without_retry_loop() 
 
     assert 'id="manual-login-recommendation"' in template
     assert 'role="status" aria-live="polite" aria-atomic="true"' in template
-    assert "扫码确认已完成，但还需要网页验证" in template
-    assert "当前安全模式无法在本页自动完成" in template
+    assert "自动网页登录暂时不可用" in template
+    assert "按下面的步骤安全导入登录状态" in template
 
-    assert 'const PLATFORM_CHALLENGE_REQUIRED = "PLATFORM_CHALLENGE_REQUIRED"' in script
-    assert "手机确认已完成，但平台要求额外网页验证" in script
-    assert "当前安全模式无法在页内自动完成" in script
+    assert "PLATFORM_CHALLENGE_REQUIRED" not in script
+    assert '"BROWSER_NOT_FOUND"' in script
+    assert '"BROWSER_LAUNCH_FAILED"' in script
+    assert '"BROWSER_CONTROL_FAILED"' in script
     fallback_branch = script[
         script.index("function renderManualLoginFallback") : script.index(
-            "function releaseBrowserQrObjectUrl"
+            "function resetBrowserLoginVisual"
         )
     ]
     assert 'classList.toggle("is-recommended", recommended)' in fallback_branch
     assert "elements.manualLoginRecommendation.hidden = !recommended" in fallback_branch
     assert "elements.manualLogin.open = true" in fallback_branch
     assert 'state.manualLoginAutoOpened = true' in fallback_branch
-    assert '"仍要尝试扫码"' in script
-    assert "重新扫码可能仍会遇到相同验证" in script
     assert "browserLoginDisplayMessage(result" in script
     assert "showToast(result?.message" not in script
-    assert "请在官方客户端完成后重新扫码" not in template
-    assert "请在官方客户端完成后重新扫码" not in script
 
     assert ".manual-login-disclosure.is-recommended" in styles
     assert ".manual-login-recommendation" in styles
-    assert '.browser-login-visual[data-state="challenge"]' in styles
+    assert '.browser-login-visual[data-state="error"]' in styles
 
 
 def test_web_cookie_import_has_safe_five_step_guidance() -> None:
@@ -614,8 +604,8 @@ def test_web_polish_keeps_polling_stable_accessible_and_cache_safe() -> None:
     assert "scale: 0.96" in styles
     assert "font-variant-numeric: tabular-nums" in styles
     assert "@media (prefers-reduced-motion: reduce)" in styles
-    assert "width: min(220px, 100%)" in styles
-    assert "outline: 1px solid oklch(0 0 0 / 0.1)" in styles
+    assert "width: min(250px, 100%)" in styles
+    assert ".official-browser-frame" in styles
     assert "min-height: 44px" in styles
     assert "asset_version" in template
     assert "ASSET_VERSION = _asset_version()" in routes
