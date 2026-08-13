@@ -1615,9 +1615,8 @@ summary:focus-visible,
 .source-tabs {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 32px;
+  gap: 14px;
   margin-bottom: 22px;
-  border-bottom: 1px solid var(--line);
 }
 
 .source-tab {
@@ -1625,26 +1624,28 @@ summary:focus-visible,
   display: flex;
   gap: 13px;
   align-items: center;
-  min-height: 86px;
-  padding: 14px 42px 18px 4px;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
+  min-height: 92px;
+  padding: 16px 48px 16px 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: 18px;
+  background: var(--surface-subtle);
+  box-shadow: var(--shadow-card);
   color: var(--ink-soft);
   text-align: left;
+  translate: 0 0;
   scale: 1;
-  transition-property: color, background-color, box-shadow, scale;
+  transition-property: color, background-color, border-color, box-shadow, translate, scale;
   transition-duration: 140ms;
   transition-timing-function: ease-out;
 }
 
 .source-tab::after {
   position: absolute;
-  right: 0;
-  bottom: -1px;
-  left: 0;
-  height: 2px;
+  right: 16px;
+  bottom: 8px;
+  left: 16px;
+  height: 3px;
+  border-radius: 999px;
   background: transparent;
   content: "";
   transition-property: background-color;
@@ -1653,18 +1654,24 @@ summary:focus-visible,
 }
 
 .source-tab:hover {
-  background: transparent;
-  box-shadow: none;
+  border-color: #cbc5bd;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-card-hover);
   color: var(--ink);
+  translate: 0 -1px;
 }
 
 .source-tab:active {
+  translate: 0 0;
   scale: 0.96;
 }
 
 .source-tab.is-active {
-  background: transparent;
-  box-shadow: none;
+  border-color: rgb(255 36 66 / 42%);
+  background: var(--accent-faint);
+  box-shadow:
+    0 0 0 1px rgb(255 36 66 / 8%),
+    0 10px 26px -22px rgb(161 18 43 / 45%);
   color: var(--ink);
 }
 
@@ -1674,7 +1681,9 @@ summary:focus-visible,
 
 .source-tab.is-active:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 3px rgb(255 36 66 / 18%);
+  box-shadow:
+    0 0 0 3px rgb(255 36 66 / 18%),
+    0 10px 26px -22px rgb(161 18 43 / 45%);
 }
 
 .tab-icon {
@@ -1684,14 +1693,14 @@ summary:focus-visible,
   flex: 0 0 auto;
   place-items: center;
   border-radius: 13px;
-  background: #fff;
-  box-shadow: none;
+  background: var(--surface-raised);
+  box-shadow: inset 0 0 0 1px rgb(23 21 19 / 5%);
   color: var(--ink-soft);
 }
 
 .source-tab.is-active .tab-icon {
   background: var(--accent-soft);
-  box-shadow: none;
+  box-shadow: inset 0 0 0 1px rgb(255 36 66 / 12%);
   color: var(--accent);
 }
 
@@ -1705,6 +1714,7 @@ summary:focus-visible,
 }
 
 .tab-copy strong {
+  color: var(--ink);
   font-size: 14px;
 }
 
@@ -1737,8 +1747,8 @@ summary:focus-visible,
 }
 
 .source-tab.is-active .tab-check {
-  background: transparent;
-  color: var(--accent);
+  background: var(--accent);
+  color: #fff;
 }
 
 .source-input-surface {

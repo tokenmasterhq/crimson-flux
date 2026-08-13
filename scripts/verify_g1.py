@@ -162,9 +162,9 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
         "minimal_cdp": (
             b"Target.getTargets" in browser
             and b"Target.attachToTarget" in browser
-            and b"Network.enable" in browser
             and b"Network.getCookies" in browser
         ),
+        "network_domain_not_enabled": b"Network.enable" not in browser,
         "no_page_execution_or_content": not any(
             marker in lowered
             for marker in (

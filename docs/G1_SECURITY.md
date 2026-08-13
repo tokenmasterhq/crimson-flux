@@ -22,7 +22,7 @@ G1 要证明这条便利路径不会控制用户日常浏览器资料、执行�
   ├─ CDP：127.0.0.1 + 随机端口
   └─ 不复用默认 Profile，不使用 shell，不接受自定义 flags / executable
         ▼
-最小 CDP：Target.getTargets / attachToTarget / Network.enable
+最小 CDP：Target.getTargets / attachToTarget
         ▼
 Network.getCookies(urls=[固定 /user/me URL])
   ├─ 只保留 xiaohongshu.com 域 Cookie
@@ -59,12 +59,12 @@ Cookie 的唯一 CDP 查询范围是：
 
 - `Target.getTargets`
 - `Target.attachToTarget`
-- `Network.enable`
 - `Network.getCookies`，且参数必须为 `urls=[COOKIE_SOURCE_URL]`
 
 明确禁止：
 
 - `Runtime.evaluate`、`Runtime.callFunctionOn` 或任何页面 JavaScript 执行；
+- `Network.enable`；读取指定 URL Cookie 不需要启用 Network domain，不得扩大事件与响应元数据表面；
 - `Network.getResponseBody`、`Fetch.getResponseBody`、DOM、截图、键盘或表单自动化；
 - `localStorage`、`sessionStorage`、IndexedDB 或浏览历史读取；
 - `Storage.getCookies`、`Network.getAllCookies` 等浏览器全局 Cookie 读取；

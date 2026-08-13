@@ -80,6 +80,7 @@ def test_canonical_browser_module_may_contain_reviewed_cdp_transport() -> None:
     "marker",
     [
         "Runtime." + "evaluate",
+        "Network." + "enable",
         "Network." + "getResponseBody",
         "Fetch." + "getResponseBody",
         "Storage." + "getCookies",
@@ -150,7 +151,6 @@ class IsolatedBrowserLoginManager:
         methods = (
             "Target.getTargets",
             "Target.attachToTarget",
-            "Network.enable",
             "Network.getCookies",
         )
         params = {"urls": [COOKIE_SOURCE_URL]}

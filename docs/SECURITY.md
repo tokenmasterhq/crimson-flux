@@ -22,7 +22,7 @@ CrimsonFlux 是本地单用户源码预览，不是互联网服务。Web 服务�
 
 为避免要求普通用户打开开发者工具，原生桌面环境可以启动一次性、可见的官方网页登录窗口。它不是用户日常浏览器：应用从固定 Chrome/Edge/Chromium 路径 allowlist 选择程序，以固定参数创建权限 `0700` 的随机临时 Profile，只打开固定官方 URL；不接受自定义 executable、flags 或 URL，也不读取默认 Profile。
 
-调试接口只绑定 `127.0.0.1` 随机端口。允许的 CDP 方法限于 `Target.getTargets`、`Target.attachToTarget`、`Network.enable` 和 URL-scoped `Network.getCookies`。禁止执行页面 JavaScript、读取响应正文、DOM、截图、localStorage、浏览历史或浏览器全局 Cookie。禁止 `--no-sandbox`、`--disable-web-security` 和通配 remote origins。
+调试接口只绑定 `127.0.0.1` 随机端口。允许的 CDP 方法仅限 `Target.getTargets`、`Target.attachToTarget` 和 URL-scoped `Network.getCookies`；明确禁止 `Network.enable`，避免订阅不必要的网络事件与响应元数据。禁止执行页面 JavaScript、读取响应正文、DOM、截图、localStorage、浏览历史或浏览器全局 Cookie。禁止 `--no-sandbox`、`--disable-web-security` 和通配 remote origins。
 
 应用只查询固定 `/user/me` URL 可用的 Cookie，过滤为平台域，要求 `a1` 与 `web_session`，再交给既有 adapter 请求 `/user/me` 验证 `guest=false` 与非空用户 ID。验证成功前不保存凭证；成功、取消、失败、超时、窗口关闭和服务关闭都必须关闭 CDP/浏览器、清空内存引用并删除临时 Profile。
 
