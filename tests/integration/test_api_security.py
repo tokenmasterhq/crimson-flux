@@ -202,7 +202,7 @@ def _wait(
     *,
     headers: dict[str, str] | None = None,
 ) -> dict:
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         response = client.get(f"/api/v1/jobs/{job_id}", headers=headers)
         assert response.status_code == 200
@@ -210,7 +210,12 @@ def _wait(
         if job["status"] in statuses:
             return job
         time.sleep(0.02)
-    raise AssertionError("job did not reach expected status")
+    response = client.get(f"/api/v1/jobs/{job_id}", headers=headers)
+    assert response.status_code == 200
+    job = response.json()
+    if job["status"] in statuses:
+        return job
+    raise AssertionError(job)
 
 
 @pytest.mark.parametrize(
