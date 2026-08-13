@@ -6,6 +6,8 @@ import ctypes
 import hashlib
 import inspect
 import json
+import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -28,9 +30,12 @@ from xhs_insight.browser_login import (
     _browser_candidates,
     _CdpConnection,
     _cookie_header_from_cdp,
+    _create_owned_profile,
+    _create_owned_profile_root_at,
     _IsolatedBrowserSession,
     _LoginSession,
     _remove_profile,
+    _remove_profile_root,
     _terminate_browser_process,
     _validate_cdp_request,
     _windows_known_folder_path,
@@ -78,7 +83,8 @@ def _manager(
         poll_seconds=0.1,
     )
     manager._executable = _executable(tmp_path)
-    manager._browser_factory = lambda _executable, _state_dir: browser
+    manager._profile_root = _create_owned_profile_root_at(tmp_path)
+    manager._browser_factory = lambda _executable, _profile_root: browser
     return manager
 
 
@@ -349,7 +355,8 @@ def test_session_initialization_does_not_enable_network_events_and_cookie_read_s
     )
     monkeypatch.setattr("xhs_insight.browser_login._CdpConnection", FakeConnection)
 
-    session = _IsolatedBrowserSession(executable, tmp_path)
+    root = _create_owned_profile_root_at(tmp_path)
+    session = _IsolatedBrowserSession(executable, root)
     try:
         assert [method for method, _params, _session_id in calls] == [
             "Target.getTargets",
@@ -358,6 +365,7 @@ def test_session_initialization_does_not_enable_network_events_and_cookie_read_s
         assert session.cookie_header() == "a1=private-a1; web_session=private-session"
     finally:
         session.close()
+        assert _remove_profile_root(root) is True
 
     assert [method for method, _params, _session_id in calls] == [
         "Target.getTargets",
@@ -1002,34 +1010,209 @@ def test_disabled_embedded_qr_never_returns_browser_state(tmp_path: Path) -> Non
 
 
 def test_profile_cleanup_removes_disposable_cookie_store(tmp_path: Path) -> None:
-    profile = tmp_path / ".browser-login-test"
-    profile.mkdir()
-    (profile / "Cookies").write_bytes(b"private-cookie-material")
+    root = _create_owned_profile_root_at(tmp_path)
+    profile = _create_owned_profile(root)
+    (profile.path / "Cookies").write_bytes(b"private-cookie-material")
 
     assert _remove_profile(profile) is True
 
-    assert not profile.exists()
+    assert not profile.path.exists()
+    assert _remove_profile_root(root) is True
     assert COOKIE_SOURCE_URL.endswith("/api/sns/web/v2/user/me")
+
+
+def test_profile_cleanup_does_not_reapply_marker_acl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _create_owned_profile_root_at(tmp_path)
+    profile = _create_owned_profile(root)
+    (profile.path / "Cookies").write_bytes(b"private-cookie-material")
+
+    def unexpected_acl_update(_path: str | Path) -> None:
+        raise AssertionError("cleanup must not rerun the Windows ACL helper")
+
+    monkeypatch.setattr(
+        "xhs_insight.security.secure_private_file", unexpected_acl_update
+    )
+
+    assert _remove_profile(profile) is True
+    assert _remove_profile_root(root) is True
+
+
+def test_profile_root_uses_system_temp_not_state_dir_and_preserves_host_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_dir = tmp_path / "persistent-state"
+    system_temp = tmp_path / "system-temp"
+    state_dir.mkdir()
+    system_temp.mkdir()
+    monkeypatch.setenv("CODEBUDDY_SAFE_DELETE", "leave-host-setting-alone")
+    monkeypatch.setattr(
+        "xhs_insight.browser_login.tempfile.gettempdir", lambda: str(system_temp)
+    )
+    manager = IsolatedBrowserLoginManager(
+        state_dir,
+        lambda *_args: {},
+        lambda: False,
+    )
+
+    root = manager._ensure_profile_root()
+
+    assert root.path.parent == system_temp
+    assert root.path.parent != state_dir
+    assert os.environ["CODEBUDDY_SAFE_DELETE"] == "leave-host-setting-alone"
+    manager.close()
+    assert manager._profile_root is None
+    assert not root.path.exists()
+
+
+def test_owned_root_and_profile_have_direct_parent_markers(tmp_path: Path) -> None:
+    root = _create_owned_profile_root_at(tmp_path)
+    profile = _create_owned_profile(root)
+
+    assert root.path.parent == Path(os.path.abspath(tmp_path))
+    assert root.path.name.startswith("crimsonflux-browser-login-")
+    assert (root.path / ".crimsonflux-owner").is_file()
+    assert root.nonce in (root.path / ".crimsonflux-owner").read_text("ascii")
+    assert profile.path.parent == root.path
+    assert profile.path.name.startswith("profile-")
+    assert profile.marker_path.parent == root.path
+    assert profile.marker_path.name == f".{profile.path.name}.owner"
+    marker = profile.marker_path.read_text("ascii")
+    assert root.nonce in marker
+    assert profile.nonce in marker
+    assert root.profiles[profile.path.name] is profile
+
+    assert _remove_profile_root(root) is True
+    assert not root.path.exists()
+
+
+@pytest.mark.parametrize("shim_behavior", ["raise", "no_op"])
+def test_safe_delete_shim_blocks_session_cleanup_and_retains_profile_for_retry(
+    shim_behavior: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _create_owned_profile_root_at(tmp_path)
+    profile = _create_owned_profile(root)
+    (profile.path / "Cookies").write_bytes(b"private-cookie-material")
+    original_rmtree = shutil.rmtree
+
+    def intercepted(_path: Path) -> None:
+        if shim_behavior == "raise":
+            raise PermissionError("synthetic WorkBuddy safe-delete block")
+
+    monkeypatch.setattr("xhs_insight.browser_login.shutil.rmtree", intercepted)
+    monkeypatch.setattr("xhs_insight.browser_login.time.sleep", lambda _delay: None)
+    session = object.__new__(_IsolatedBrowserSession)
+    session._profile = profile
+    session._process = None
+    session._connection = None
+    session._session_id = None
+    session._close_lock = threading.RLock()
+
+    with pytest.raises(BrowserLoginError) as captured:
+        session.close()
+
+    assert captured.value.code == "BROWSER_PROFILE_CLEANUP_FAILED"
+    assert session._profile is profile
+    assert profile.path.exists()
+    assert root.profiles[profile.path.name] is profile
+
+    monkeypatch.setattr("xhs_insight.browser_login.shutil.rmtree", original_rmtree)
+    session.close()
+    assert session._profile is None
+    assert not profile.path.exists()
+    assert _remove_profile_root(root) is True
+
+
+@pytest.mark.parametrize("invalid_location", ["outside", "wrong_prefix"])
+def test_profile_cleanup_rejects_unowned_location_without_recursive_delete(
+    invalid_location: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _create_owned_profile_root_at(tmp_path)
+    profile = _create_owned_profile(root)
+    owned_path = profile.path
+    if invalid_location == "outside":
+        outside = tmp_path / "outside" / owned_path.name
+        outside.mkdir(parents=True)
+        profile.path = outside
+    else:
+        profile.path = root.path / "not-an-owned-profile"
+    recursive_calls: list[Path] = []
+    monkeypatch.setattr(
+        "xhs_insight.browser_login.shutil.rmtree",
+        lambda path: recursive_calls.append(Path(path)),
+    )
+    monkeypatch.setattr("xhs_insight.browser_login.time.sleep", lambda _delay: None)
+
+    assert _remove_profile(profile) is False
+    assert recursive_calls == []
+
+    profile.path = owned_path
+
+
+def test_profile_cleanup_rejects_symlink_without_recursive_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _create_owned_profile_root_at(tmp_path)
+    profile = _create_owned_profile(root)
+    target = tmp_path / "must-not-delete"
+    target.mkdir()
+    shutil.rmtree(profile.path)
+    try:
+        profile.path.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error}")
+    recursive_calls: list[Path] = []
+    monkeypatch.setattr(
+        "xhs_insight.browser_login.shutil.rmtree",
+        lambda path: recursive_calls.append(Path(path)),
+    )
+    monkeypatch.setattr("xhs_insight.browser_login.time.sleep", lambda _delay: None)
+
+    assert _remove_profile(profile) is False
+    assert recursive_calls == []
+    assert target.is_dir()
+
+
+def test_manager_close_removes_empty_owned_profile_root(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, lambda *_args: {}, _FakeBrowser([None]))
+    root = manager._profile_root
+    assert root is not None
+    assert root.path.exists()
+
+    manager.close()
+
+    assert manager._profile_root is None
+    assert not root.path.exists()
 
 
 def test_profile_cleanup_reports_a_locked_residual(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    profile = tmp_path / ".browser-login-locked"
-    profile.mkdir()
+    root = _create_owned_profile_root_at(tmp_path)
+    profile = _create_owned_profile(root)
     monkeypatch.setattr("xhs_insight.browser_login.shutil.rmtree", lambda _path: None)
     monkeypatch.setattr("xhs_insight.browser_login.time.sleep", lambda _seconds: None)
 
     assert _remove_profile(profile) is False
+    assert profile.path.exists()
+    assert root.profiles[profile.path.name] is profile
 
 
 def test_windows_profile_cleanup_uses_bounded_backoff(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    profile = tmp_path / ".browser-login-windows-locked"
-    profile.mkdir()
+    root = _create_owned_profile_root_at(tmp_path)
+    profile = _create_owned_profile(root)
     delays: list[float] = []
     monkeypatch.setattr("xhs_insight.browser_login.platform.system", lambda: "Windows")
     monkeypatch.setattr("xhs_insight.browser_login.shutil.rmtree", lambda _path: None)

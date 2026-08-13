@@ -18,6 +18,7 @@ _RETIRED_PROJECT = "Spider" + "_XHS"
 _RETIRED_IMPORT = "xhs_" + "utils.xhs_pc"
 _RETIRED_PATH = _RETIRED_ROOT + "/spider_" + "xhs"
 _RETIRED_COMMIT = "2030f5d4454e556ad7a9" + "caa83b3ec532d4df20c7"
+_HOST_SAFE_DELETE_KEY = "CODE" + "BUDDY_SAFE_DELETE_ROOT"
 
 
 @pytest.mark.parametrize(
@@ -114,6 +115,78 @@ def test_canonical_browser_module_rejects_shell_launch() -> None:
 
 
 @pytest.mark.parametrize(
+    "source, reason",
+    [
+        (
+            b"import tempfile\ntempfile.tempdir = '/chosen/root'\n",
+            "canonical browser login overrides the system temp root",
+        ),
+        (
+            b"import tempfile\ntempfile.mkdtemp(prefix='profile-', dir=state_dir)\n",
+            "browser profile is allocated under persistent state",
+        ),
+        (
+            b"from pathlib import Path\nlist(Path('/tmp').glob('profile-*'))\n",
+            "canonical browser cleanup uses broad path enumeration",
+        ),
+        (
+            b"import glob\nglob.glob('/tmp/profile-*')\n",
+            "canonical browser cleanup uses broad path enumeration",
+        ),
+        (
+            b"import subprocess\nsubprocess.run(['rm', '-rf', target], shell=False, "
+            b"stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+            b"stderr=subprocess.DEVNULL, timeout=12)\n",
+            "canonical browser cleanup invokes an external delete helper",
+        ),
+    ],
+)
+def test_canonical_browser_module_rejects_unsafe_profile_cleanup_patterns(
+    source: bytes,
+    reason: str,
+) -> None:
+    findings = _scan_payload(PurePosixPath("src/xhs_insight/browser_login.py"), source)
+
+    assert any(item.reason == reason for item in findings)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "os.environ.pop({key!r}, None)",
+        "os.unsetenv({key!r})",
+        "del os.environ[{key!r}]",
+        "child_env.pop({key!r}, None)",
+        "os.getenv({key!r})",
+        "os.environ[{key!r}]",
+        "probe = {key!r}",
+    ],
+)
+def test_product_code_cannot_reference_host_safe_delete_controls(statement: str) -> None:
+    source = ("import os\n" + statement.format(key=_HOST_SAFE_DELETE_KEY) + "\n").encode()
+
+    findings = _scan_payload(PurePosixPath("src/xhs_insight/probe.py"), source)
+
+    assert any(
+        item.reason == "product code references or mutates host safe-delete controls"
+        for item in findings
+    )
+
+
+def test_non_python_product_code_cannot_bypass_host_safe_delete_controls() -> None:
+    source = f"delete process.env.{_HOST_SAFE_DELETE_KEY};\n".encode()
+
+    findings = _scan_payload(
+        PurePosixPath("src/xhs_insight/web/static/probe.js"), source
+    )
+
+    assert any(
+        item.reason == "product code references or mutates host safe-delete controls"
+        for item in findings
+    )
+
+
+@pytest.mark.parametrize(
     "source",
     [
         b"import os\nroot = os.environ.get('PROGRAMFILES')\n",
@@ -162,165 +235,96 @@ def test_browser_login_g1_contract_requires_isolation_scope_verification_and_cle
     browser = package / "browser_login.py"
     adapter = adapter_dir / "live.py"
     app = api_dir / "app.py"
-    browser.write_text(
-        '''
-import shutil
-import subprocess
-import tempfile
-
-OFFICIAL_LOGIN_URL = "https://www.xiaohongshu.com/explore"
-COOKIE_SOURCE_URL = "https://edith.xiaohongshu.com/api/sns/web/v2/user/me"
-WINDOWS_SUFFIXES = (
-    "Google/Chrome/Application/chrome.exe",
-    "Microsoft/Edge/Application/msedge.exe",
-    "Chromium/Application/chrome.exe",
-)
-def _windows_known_folders():
-    return SHGetKnownFolderPath(FOLDERID_ProgramFiles)
-def _browser_candidates():
-    return ("fixed",)
-
-def find_supported_browser():
-    return _browser_candidates()[0]
-
-class IsolatedBrowserLoginManager:
-    def run(self):
-        profile = tempfile.mkdtemp()
-        profile_path.chmod(0o700)
-        flags = [
-            "--remote-debugging-address=127.0.0.1",
-            "--remote-debugging-port=0",
-            "--user-data-dir=" + profile,
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-sync",
-            "--disable-extensions",
-            "--new-window",
-        ]
-        port_file = "DevToolsActivePort"
-        methods = (
-            "Target.getTargets",
-            "Target.attachToTarget",
-            "Network.getCookies",
-        )
-        params = {"urls": [COOKIE_SOURCE_URL]}
-        required = {"a1", "web_session"}
-        pid = getattr(process, "pid", None)
-        if type(pid) is int:
-            subprocess.run(
-                ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=_WINDOWS_TREE_KILL_TIMEOUT_SECONDS,
-                shell=False,
-            )
-        def stopped() -> bool:
-            return session.cancel_event.is_set() or time.monotonic() >= session.deadline
-        def cleanup_before_persist():
-            browser.close()
-            return _SessionCommitGuard(session)
-        result = self._import_cookie(
-            candidate,
-            stopped,
-            cleanup_before_persist,
-        )
-        with current.commit_lock:
-            committed = current.committed
-        try:
-            return flags, port_file, methods, params, required
-        finally:
-            process.terminate()
-            process.kill()
-            shutil.rmtree(profile)
-
-class _SessionCommitGuard:
-    def __enter__(self):
-        session.commit_lock.acquire()
-        if session.cancel_event.is_set() or time.monotonic() >= session.deadline:
-            raise PermissionError
-        return self
-
-    def __exit__(self, exc_type, _value, _traceback):
-        if exc_type is None:
-            self._session.committed = True
-''',
-        encoding="utf-8",
-    )
-    adapter.write_text(
-        '''
-class Adapter:
-        def verify_cookie(self, cookie):
-            data = candidate.get_user_me()
-            guest = data.get("guest")
-            if guest is not False:
-                raise ValueError
-            account_id = str(data.get("user_id") or "")
-            return data
-
-class Backend:
-    def import_cookie(self, cookie):
-        verified = self.adapter.verify_cookie(cookie)
-        return self.auth.persist_verified_login(cookie=verified.cookie)
-''',
-        encoding="utf-8",
-    )
-    app.write_text(
-        '''
-class Backend:
-    def import_cookie(self, cookie, before_persist):
-        verified = self.adapter.verify_cookie(cookie)
-        commit_guard = nullcontext()
-        candidate_guard = before_persist()
-        if candidate_guard is not None:
-            commit_guard = candidate_guard
-        with commit_guard:
-            return self.auth.persist_verified_login(cookie=verified.cookie)
-''',
-        encoding="utf-8",
-    )
+    shutil.copyfile(ROOT / "src" / "xhs_insight" / "browser_login.py", browser)
+    shutil.copyfile(ROOT / "src" / "xhs_insight" / "adapters" / "rednote" / "live.py", adapter)
+    shutil.copyfile(ROOT / "src" / "xhs_insight" / "api" / "app.py", app)
 
     detail = _browser_login_check(tmp_path)["detail"]
     assert all(detail.values()), detail
 
+    browser_source = browser.read_text(encoding="utf-8")
+    app_source = app.read_text(encoding="utf-8")
+
+    def changed(source: str, needle: str, replacement: str) -> str:
+        assert needle in source
+        return source.replace(needle, replacement, 1)
+
     browser.write_text(
-        browser.read_text(encoding="utf-8").replace(
+        changed(
+            browser_source,
             '{"urls": [COOKIE_SOURCE_URL]}', '{"urls": [user_input]}'
         ),
         encoding="utf-8",
     )
-
     assert _browser_login_check(tmp_path)["detail"]["url_scoped_cookie_query"] is False
+    browser.write_text(browser_source, encoding="utf-8")
 
-    source = app.read_text(encoding="utf-8")
     app.write_text(
-        source.replace(
-            "        with commit_guard:\n"
-            "            return self.auth.persist_verified_login(cookie=verified.cookie)",
-            "        result = self.auth.persist_verified_login(cookie=verified.cookie)\n"
-            "        with commit_guard:\n"
-            "            return result",
+        changed(
+            app_source,
+            "candidate_guard = before_persist()",
+            "candidate_guard = None",
         ),
         encoding="utf-8",
     )
     assert _browser_login_check(tmp_path)["detail"]["cleanup_barrier_before_persist"] is False
+    app.write_text(app_source, encoding="utf-8")
 
     browser.write_text(
-        browser.read_text(encoding="utf-8").replace(
-            "return SHGetKnownFolderPath(FOLDERID_ProgramFiles)",
-            "return os.environ.get('PROGRAMFILES')",
+        changed(
+            browser_source,
+            "get_known_folder = shell32.SHGetKnownFolderPath",
+            "get_known_folder = os.environ.get('PROGRAMFILES')",
         ),
         encoding="utf-8",
     )
     assert _browser_login_check(tmp_path)["detail"]["windows_known_folder_roots"] is False
+    browser.write_text(browser_source, encoding="utf-8")
 
-    browser_source = browser.read_text(encoding="utf-8")
     browser.write_text(
-        browser_source.replace("            self._session.committed = True\n", ""),
+        changed(browser_source, "            self._session.committed = True\n", ""),
         encoding="utf-8",
     )
     assert (
         _browser_login_check(tmp_path)["detail"]["cancel_and_deadline_guard_persist"]
+        is False
+    )
+    browser.write_text(browser_source, encoding="utf-8")
+
+    browser.write_text(
+        changed(
+            browser_source,
+            "_create_owned_profile_root_at(Path(tempfile.gettempdir()))",
+            "_create_owned_profile_root_at(state_dir)",
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        _browser_login_check(tmp_path)["detail"]["system_temp_dedicated_profile_root"]
+        is False
+    )
+    browser.write_text(browser_source, encoding="utf-8")
+
+    browser.write_text(
+        changed(browser_source, "def _validate_profile(", "def unsafe_profile_check("),
+        encoding="utf-8",
+    )
+    assert (
+        _browser_login_check(tmp_path)["detail"]["profile_owner_and_link_validation"]
+        is False
+    )
+    browser.write_text(browser_source, encoding="utf-8")
+
+    browser.write_text(
+        changed(
+            browser_source,
+            "shutil.rmtree(profile.path)",
+            "shutil.rmtree(profile.root.path)",
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        _browser_login_check(tmp_path)["detail"]["exact_fail_closed_profile_cleanup"]
         is False
     )
 

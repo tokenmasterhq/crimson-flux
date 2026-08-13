@@ -19,6 +19,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import tempfile
@@ -34,6 +35,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from xhs_insight.domain import AdapterErrorCode
+from xhs_insight.security import write_private_file
 
 OFFICIAL_LOGIN_URL = "https://www.xiaohongshu.com/explore"
 COOKIE_SOURCE_URL = "https://edith.xiaohongshu.com/api/sns/web/v2/user/me"
@@ -71,6 +73,17 @@ _MAX_COOKIE_COUNT = 64
 _WINDOWS_TREE_KILL_TIMEOUT_SECONDS = 12.0
 _WINDOWS_PROFILE_CLEANUP_DELAYS = (0.1, 0.2, 0.4, 0.8, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0)
 _DEFAULT_PROFILE_CLEANUP_DELAYS = (0.05, 0.1, 0.2, 0.4)
+_PROFILE_ROOT_PREFIX = "crimsonflux-browser-login-"
+_PROFILE_SESSION_PREFIX = "profile-"
+_PROFILE_OWNER_MARKER = ".crimsonflux-owner"
+_PROFILE_SESSION_MARKER_SUFFIX = ".owner"
+_PROFILE_ROOT_NAME_RE = re.compile(r"^crimsonflux-browser-login-[0-9A-Za-z_-]{8,64}$")
+_PROFILE_SESSION_NAME_RE = re.compile(r"^profile-[0-9A-Za-z_-]{8,64}$")
+_PROFILE_NONCE_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROFILE_MARKER_MAX_BYTES = 256
+_FILE_ATTRIBUTE_REPARSE_POINT = int(
+    getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400)
+)
 
 # These are the account/session and request-context cookies used by the fixed
 # local collector.  Analytics, preference and unrelated site cookies are not
@@ -700,51 +713,344 @@ def _cookie_header_from_cdp(payload: Any) -> str | None:
     return header
 
 
-def _remove_profile(profile_dir: Path | None) -> bool:
-    if profile_dir is None:
+def _has_reparse_attribute(metadata: os.stat_result) -> bool:
+    return bool(
+        int(getattr(metadata, "st_file_attributes", 0))
+        & _FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _directory_lstat(path: Path) -> os.stat_result:
+    metadata = path.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or _has_reparse_attribute(metadata)
+    ):
+        raise RuntimeError("临时浏览器目录所有权校验失败")
+    return metadata
+
+
+def _owned_directory_lstat(path: Path) -> os.stat_result:
+    metadata = _directory_lstat(path)
+    if os.name != "nt":
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise RuntimeError("临时浏览器目录不属于当前用户")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise RuntimeError("临时浏览器目录权限过宽")
+    return metadata
+
+
+def _regular_lstat(path: Path) -> os.stat_result:
+    metadata = path.lstat()
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or _has_reparse_attribute(metadata)
+    ):
+        raise RuntimeError("临时浏览器标记所有权校验失败")
+    return metadata
+
+
+def _path_absent(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
+    return os.path.samestat(left, right) and (
+        left.st_mode,
+        left.st_size,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_mode,
+        right.st_size,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
+
+
+def _read_owned_marker(path: Path, expected: os.stat_result) -> bytes:
+    """Read an already-hardened ownership marker without reapplying its ACL."""
+
+    before = _regular_lstat(path)
+    if not _same_file_state(before, expected):
+        raise RuntimeError("临时浏览器标记已被替换或修改")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _has_reparse_attribute(opened)
+            or not _same_file_state(opened, expected)
+        ):
+            raise RuntimeError("临时浏览器标记读取校验失败")
+        payload = bytearray()
+        while len(payload) <= _PROFILE_MARKER_MAX_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(256, _PROFILE_MARKER_MAX_BYTES + 1 - len(payload)),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > _PROFILE_MARKER_MAX_BYTES:
+            raise RuntimeError("临时浏览器标记超过安全大小限制")
+        if not _same_file_state(_regular_lstat(path), expected):
+            raise RuntimeError("临时浏览器标记读取时已变化")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
+
+
+def _root_marker_payload(nonce: str) -> bytes:
+    return f"crimsonflux-browser-login-root-v1\n{nonce}\n".encode("ascii")
+
+
+def _profile_marker_payload(root_nonce: str, profile_nonce: str) -> bytes:
+    return (
+        f"crimsonflux-browser-login-profile-v1\n{root_nonce}\n{profile_nonce}\n"
+    ).encode("ascii")
+
+
+@dataclass(slots=True)
+class _OwnedProfileRoot:
+    path: Path
+    nonce: str = field(repr=False)
+    identity: os.stat_result = field(repr=False)
+    marker_identity: os.stat_result = field(repr=False)
+    temp_parent: Path
+    temp_parent_identity: os.stat_result = field(repr=False)
+    profiles: dict[str, _OwnedProfile] = field(default_factory=dict, repr=False)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+
+@dataclass(slots=True)
+class _OwnedProfile:
+    root: _OwnedProfileRoot = field(repr=False)
+    path: Path
+    nonce: str = field(repr=False)
+    identity: os.stat_result = field(repr=False)
+    marker_path: Path
+    marker_identity: os.stat_result = field(repr=False)
+
+
+def _validate_root(root: _OwnedProfileRoot) -> None:
+    if (
+        not _PROFILE_NONCE_RE.fullmatch(root.nonce)
+        or not _PROFILE_ROOT_NAME_RE.fullmatch(root.path.name)
+        or root.path.parent != root.temp_parent
+        or not os.path.samestat(
+            _directory_lstat(root.temp_parent), root.temp_parent_identity
+        )
+        or not os.path.samestat(_owned_directory_lstat(root.path), root.identity)
+    ):
+        raise RuntimeError("临时浏览器根目录所有权校验失败")
+    marker = root.path / _PROFILE_OWNER_MARKER
+    if not os.path.samestat(_regular_lstat(marker), root.marker_identity):
+        raise RuntimeError("临时浏览器根目录标记已被替换")
+    if _read_owned_marker(marker, root.marker_identity) != _root_marker_payload(
+        root.nonce
+    ):
+        raise RuntimeError("临时浏览器根目录标记无效")
+    if not os.path.samestat(_regular_lstat(marker), root.marker_identity):
+        raise RuntimeError("临时浏览器根目录标记读取时已变化")
+
+
+def _validate_profile(profile: _OwnedProfile, *, require_directory: bool = True) -> None:
+    root = profile.root
+    _validate_root(root)
+    if (
+        not _PROFILE_NONCE_RE.fullmatch(profile.nonce)
+        or not _PROFILE_SESSION_NAME_RE.fullmatch(profile.path.name)
+        or profile.path.parent != root.path
+        or root.profiles.get(profile.path.name) is not profile
+        or profile.marker_path
+        != root.path / f".{profile.path.name}{_PROFILE_SESSION_MARKER_SUFFIX}"
+    ):
+        raise RuntimeError("临时浏览器会话目录所有权校验失败")
+    if require_directory and not os.path.samestat(
+        _owned_directory_lstat(profile.path), profile.identity
+    ):
+        raise RuntimeError("临时浏览器会话目录已被替换")
+    if not os.path.samestat(
+        _regular_lstat(profile.marker_path), profile.marker_identity
+    ):
+        raise RuntimeError("临时浏览器会话标记已被替换")
+    if _read_owned_marker(
+        profile.marker_path, profile.marker_identity
+    ) != _profile_marker_payload(root.nonce, profile.nonce):
+        raise RuntimeError("临时浏览器会话标记无效")
+    if not os.path.samestat(
+        _regular_lstat(profile.marker_path), profile.marker_identity
+    ):
+        raise RuntimeError("临时浏览器会话标记读取时已变化")
+
+
+def _create_owned_profile_root_at(temp_parent: Path) -> _OwnedProfileRoot:
+    parent = Path(os.path.abspath(temp_parent))
+    parent_identity = _directory_lstat(parent)
+    path = Path(tempfile.mkdtemp(prefix=_PROFILE_ROOT_PREFIX, dir=parent))
+    try:
+        os.chmod(path, 0o700)
+        identity = _owned_directory_lstat(path)
+        nonce = secrets.token_hex(32)
+        marker_identity = write_private_file(
+            path / _PROFILE_OWNER_MARKER, _root_marker_payload(nonce)
+        )
+        root = _OwnedProfileRoot(
+            path=path,
+            nonce=nonce,
+            identity=identity,
+            marker_identity=marker_identity,
+            temp_parent=parent,
+            temp_parent_identity=parent_identity,
+        )
+        _validate_root(root)
+        return root
+    except BaseException:
+        # The directory was just created by this call and contains at most our
+        # private marker.  Never recurse over a root whose ownership is unknown.
+        marker = path / _PROFILE_OWNER_MARKER
+        with suppress(OSError):
+            marker.unlink()
+        with suppress(OSError):
+            path.rmdir()
+        raise
+
+
+def _create_owned_profile_root() -> _OwnedProfileRoot:
+    """Create one application-owned root under Python's system temp directory."""
+
+    return _create_owned_profile_root_at(Path(tempfile.gettempdir()))
+
+
+def _create_owned_profile(root: _OwnedProfileRoot) -> _OwnedProfile:
+    with root.lock:
+        _validate_root(root)
+        path = Path(tempfile.mkdtemp(prefix=_PROFILE_SESSION_PREFIX, dir=root.path))
+        try:
+            os.chmod(path, 0o700)
+            identity = _owned_directory_lstat(path)
+            nonce = secrets.token_hex(32)
+            marker_path = root.path / (
+                f".{path.name}{_PROFILE_SESSION_MARKER_SUFFIX}"
+            )
+            marker_identity = write_private_file(
+                marker_path, _profile_marker_payload(root.nonce, nonce)
+            )
+            profile = _OwnedProfile(
+                root=root,
+                path=path,
+                nonce=nonce,
+                identity=identity,
+                marker_path=marker_path,
+                marker_identity=marker_identity,
+            )
+            root.profiles[path.name] = profile
+            _validate_profile(profile)
+            return profile
+        except BaseException:
+            marker_path = root.path / f".{path.name}{_PROFILE_SESSION_MARKER_SUFFIX}"
+            with suppress(OSError):
+                marker_path.unlink()
+            with suppress(OSError):
+                path.rmdir()
+            raise
+
+
+def _remove_profile(profile: _OwnedProfile | None) -> bool:
+    if profile is None:
         return True
     delays = (
         _WINDOWS_PROFILE_CLEANUP_DELAYS
         if platform.system() == "Windows"
         else _DEFAULT_PROFILE_CLEANUP_DELAYS
     )
-    for delay in delays:
-        with suppress(OSError):
-            shutil.rmtree(profile_dir)
-        if not profile_dir.exists():
-            return True
-        time.sleep(delay)
-    with suppress(OSError):
-        shutil.rmtree(profile_dir)
-    if not profile_dir.exists():
+    with profile.root.lock:
+        for delay in (*delays, None):
+            try:
+                directory_absent = _path_absent(profile.path)
+                _validate_profile(profile, require_directory=not directory_absent)
+                if not directory_absent:
+                    # Exact, registered path only.  No glob, shell or root-wide
+                    # recursive deletion is permitted at this boundary.
+                    shutil.rmtree(profile.path)
+                if _path_absent(profile.path):
+                    profile.marker_path.unlink(missing_ok=True)
+                    if _path_absent(profile.marker_path):
+                        profile.root.profiles.pop(profile.path.name, None)
+                        return True
+            except Exception:
+                pass
+            if delay is not None:
+                time.sleep(delay)
+        return False
+
+
+def _remove_profile_root(root: _OwnedProfileRoot | None) -> bool:
+    if root is None:
         return True
-    # Best-effort hardening if Windows still has a lock.  The owning session
-    # retains the path and process reference so a later close() can retry.
-    with suppress(OSError):
-        os.chmod(profile_dir, 0o700)
-    return not profile_dir.exists()
+    with root.lock:
+        for profile in tuple(root.profiles.values()):
+            if not _remove_profile(profile):
+                return False
+        try:
+            _validate_root(root)
+            marker = root.path / _PROFILE_OWNER_MARKER
+            entries = tuple(root.path.iterdir())
+            if entries != (marker,):
+                return False
+            marker.unlink()
+            if not _path_absent(marker):
+                return False
+            if not os.path.samestat(_owned_directory_lstat(root.path), root.identity):
+                return False
+            if any(root.path.iterdir()):
+                return False
+            root.path.rmdir()
+            if _path_absent(root.path):
+                return True
+            # A delete shim may silently no-op.  Restore the marker so the same
+            # owned root can be validated and retried later.
+            root.marker_identity = write_private_file(
+                marker, _root_marker_payload(root.nonce)
+            )
+        except Exception:
+            marker = root.path / _PROFILE_OWNER_MARKER
+            if not _path_absent(root.path) and _path_absent(marker):
+                with suppress(Exception):
+                    root.marker_identity = write_private_file(
+                        marker, _root_marker_payload(root.nonce)
+                    )
+        return False
 
 
 class _IsolatedBrowserSession:
     def __init__(
         self,
         executable: BrowserExecutable,
-        state_dir: Path,
+        profile_root: _OwnedProfileRoot,
         *,
         launch_timeout: float = 20.0,
     ) -> None:
-        self._profile_dir: Path | None = Path(
-            tempfile.mkdtemp(prefix=".browser-login-", dir=state_dir)
-        )
-        with suppress(OSError):
-            os.chmod(self._profile_dir, 0o700)
+        self._profile: _OwnedProfile | None = _create_owned_profile(profile_root)
         self._process: subprocess.Popen[bytes] | None = None
         self._connection: _CdpConnection | None = None
         self._session_id: str | None = None
         self._close_lock = threading.RLock()
         try:
             self._process = subprocess.Popen(
-                _browser_argv(executable, self._profile_dir),
+                _browser_argv(executable, self._profile.path),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -754,7 +1060,7 @@ class _IsolatedBrowserSession:
             )
             endpoint_deadline = time.monotonic() + max(3.0, min(launch_timeout, 30.0))
             port, path = _read_devtools_endpoint(
-                self._profile_dir,
+                self._profile.path,
                 self._process,
                 deadline=endpoint_deadline,
             )
@@ -830,13 +1136,13 @@ class _IsolatedBrowserSession:
                         "BROWSER_PROFILE_CLEANUP_FAILED",
                         "临时浏览器进程未能安全关闭，请关闭官方窗口后重试。",
                     )
-            profile = self._profile_dir
+            profile = self._profile
             if not _remove_profile(profile):
                 raise BrowserLoginError(
                     "BROWSER_PROFILE_CLEANUP_FAILED",
                     "临时浏览器资料未能安全清理，请关闭官方窗口后重试。",
                 )
-            self._profile_dir = None
+            self._profile = None
             self._process = None
 
 
@@ -906,17 +1212,41 @@ class IsolatedBrowserLoginManager:
         timeout_seconds: int = DEFAULT_LOGIN_TIMEOUT_SECONDS,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
     ) -> None:
-        self._state_dir = state_dir
+        # Kept in the public constructor for compatibility with callers, but
+        # persistent state must never select the disposable browser location.
+        del state_dir
         self._import_cookie = import_cookie
         self._active_jobs = active_jobs
         self._timeout_seconds = max(30, min(int(timeout_seconds), 600))
         self._poll_seconds = max(0.1, min(float(poll_seconds), 5.0))
         self._executable = find_supported_browser()
-        self._browser_factory: Callable[[BrowserExecutable, Path], Any] = (
+        self._browser_factory: Callable[[BrowserExecutable, _OwnedProfileRoot], Any] = (
             _IsolatedBrowserSession
         )
         self._lock = threading.RLock()
         self._session: _LoginSession | None = None
+        self._profile_root: _OwnedProfileRoot | None = None
+
+    def _ensure_profile_root(self) -> _OwnedProfileRoot:
+        root = self._profile_root
+        if root is not None:
+            try:
+                _validate_root(root)
+            except Exception:
+                raise BrowserLoginError(
+                    "BROWSER_PROFILE_CLEANUP_FAILED",
+                    "临时浏览器目录所有权校验失败，请重启服务后重试。",
+                ) from None
+            return root
+        try:
+            root = _create_owned_profile_root()
+        except Exception:
+            raise BrowserLoginError(
+                "BROWSER_LAUNCH_FAILED",
+                "无法在系统临时目录创建受保护的浏览器资料。",
+            ) from None
+        self._profile_root = root
+        return root
 
     def capability(self) -> dict[str, Any]:
         supported = self._executable is not None
@@ -1069,6 +1399,7 @@ class IsolatedBrowserLoginManager:
                             "临时浏览器资料未能安全清理，请关闭官方窗口后重试。",
                         ) from None
                     previous.browser = None
+            self._ensure_profile_root()
             now = time.time()
             session = _LoginSession(
                 internal_id=secrets.token_urlsafe(24),
@@ -1124,25 +1455,39 @@ class IsolatedBrowserLoginManager:
     def close(self) -> None:
         with self._lock:
             current = self._session
-            if current is None:
-                return
-            with current.commit_lock:
-                if current.committed:
-                    current.status = "succeeded"
-                    current.message = "网页登录成功，登录态已验证并加密保存在本机。"
-                    current.error_code = None
-                else:
-                    current.cancel_event.set()
-                    if current.status in _ACTIVE_STATUSES:
-                        current.status = "cancelled"
-                        current.message = "已取消网页登录。"
+            browser = None
+            thread = None
+            if current is not None:
+                with current.commit_lock:
+                    if current.committed:
+                        current.status = "succeeded"
+                        current.message = "网页登录成功，登录态已验证并加密保存在本机。"
                         current.error_code = None
-                browser = current.browser
-                thread = current.thread
-        if browser is not None:
+                    else:
+                        current.cancel_event.set()
+                        if current.status in _ACTIVE_STATUSES:
+                            current.status = "cancelled"
+                            current.message = "已取消网页登录。"
+                            current.error_code = None
+                    browser = current.browser
+                    thread = current.thread
+        if current is not None and browser is not None:
             self._close_session_browser(current, browser)
         if thread is not None and thread.is_alive():
             thread.join(timeout=10)
+        with self._lock:
+            cleanup_pending = (
+                current is not None
+                and (
+                    current.browser is not None
+                    or (current.thread is not None and current.thread.is_alive())
+                )
+            )
+            root = None if cleanup_pending else self._profile_root
+        if root is not None and _remove_profile_root(root):
+            with self._lock:
+                if self._profile_root is root:
+                    self._profile_root = None
 
     def _run(self, session: _LoginSession) -> None:
         browser: Any | None = None
@@ -1179,7 +1524,13 @@ class IsolatedBrowserLoginManager:
             if session.cancel_event.is_set():
                 raise _Cancelled
             assert self._executable is not None
-            browser = self._browser_factory(self._executable, self._state_dir)
+            root = self._profile_root
+            if root is None:
+                raise BrowserLoginError(
+                    "BROWSER_LAUNCH_FAILED",
+                    "临时浏览器目录尚未准备完成。",
+                )
+            browser = self._browser_factory(self._executable, root)
             session.browser = browser
             self._set_status(
                 session,

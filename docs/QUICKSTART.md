@@ -4,6 +4,22 @@
 
 公开版本必须有 [RELEASE_GATES.md](RELEASE_GATES.md) 中 G0 与 G1 的通过记录。G0 核对来源、Git 历史、依赖许可与归档内容；G1 核对固定 Python 签名、隔离的官方网页登录和凭证边界。本项目没有可由用户启用的演示/fixture 模式。
 
+## 使用 WorkBuddy 安装
+
+WorkBuddy 适合负责克隆仓库、检查 Python 3.12，并执行一次安装准备：
+
+```bash
+python scripts/start.py --prepare-only
+```
+
+准备完成后，不要让正式服务继续作为 WorkBuddy 安装任务或工具命令的长期子进程运行。请让 WorkBuddy 生成一个由用户点击的本地启动入口；如果没有生成入口，就打开一个新的普通系统终端，进入项目目录后执行：
+
+```bash
+python scripts/start.py
+```
+
+这样后续的网页登录窗口、服务停止和再次启动都属于普通本机应用流程。无需复制安装任务中的命令环境，也无需修改系统环境变量。
+
 ## 路径 A：Docker Compose
 
 需要 Docker Engine/Desktop 与 Compose v2，不需要在宿主机安装 Python。
@@ -48,7 +64,9 @@ python scripts/start.py
 
 脚本只检查现有环境、创建仓库内 `.venv`、按 `requirements.lock` 安装带哈希依赖、初始化数据库并启动服务。它不安装系统软件，不请求管理员权限，也不修改 shell、代理或防火墙。
 
-原生模式会从固定安装位置寻找 Chrome、Edge 或 Chromium。点击“打开官方网页登录”后，程序会使用一次性临时资料目录打开官方网页；你可在官方窗口完成扫码、确认或短信验证。验证成功后窗口自动关闭，临时资料被删除，日常浏览器 Profile 不会被读取。
+原生模式会从固定安装位置寻找 Chrome、Edge 或 Chromium。点击“打开官方网页登录”后，程序会在操作系统当前用户的临时目录（Temp）创建权限受限的一次性浏览器 Profile；它不位于保存数据库和密钥的状态目录，也不会读取日常浏览器 Profile。你可在官方窗口完成扫码、确认或短信验证；结束后程序会关闭窗口，并从正在使用的临时路径清理这份 Profile。
+
+这里的“清理”表示应用不再使用该临时 Profile，并将它从原临时路径移除；它不是对磁盘物理擦除的承诺。异常断电、系统回收站或备份策略仍可能影响底层数据保留方式。
 
 只准备环境：
 
@@ -56,7 +74,7 @@ python scripts/start.py
 python scripts/start.py --prepare-only
 ```
 
-然后可手动启动：
+准备完成后，可在新的普通系统终端中运行 `python scripts/start.py`。需要绕过启动脚本手动启动服务时，可执行：
 
 ```bash
 .venv/bin/uvicorn xhs_insight.api.app:create_app --factory --host 127.0.0.1 --port 8765

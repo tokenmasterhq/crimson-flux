@@ -17,8 +17,8 @@ from typing import Any
 from scan_release import scan_g1_tree, scan_git_history, scan_source, source_file_paths
 
 ROOT = Path(__file__).resolve().parents[1]
-POLICY_VERSION = "crimsonflux-g1-v9-windows-known-folder-executables"
-EVIDENCE_SCHEMA = "https://crimsonflux.local/schemas/g1-evidence-v9.json"
+POLICY_VERSION = "crimsonflux-g1-v10-owned-system-temp-profile"
+EVIDENCE_SCHEMA = "https://crimsonflux.local/schemas/g1-evidence-v10.json"
 
 
 def _digest(payload: bytes) -> str:
@@ -165,8 +165,61 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
                 )
             )
         ),
-        "isolated_profile": b"tempfile.mkdtemp(" in browser and b"--user-data-dir=" in browser,
-        "profile_mode_0700": b"0o700" in browser and b"chmod(" in browser,
+        "system_temp_dedicated_profile_root": (
+            b"_PROFILE_ROOT_PREFIX" in browser
+            and b"_PROFILE_SESSION_PREFIX" in browser
+            and b"def _create_owned_profile_root(" in browser
+            and b"_create_owned_profile_root_at(Path(tempfile.gettempdir()))" in browser
+            and b"def _create_owned_profile(" in browser
+            and b"--user-data-dir=" in browser
+            and b"del state_dir" in browser
+            and b"dir=state_dir" not in browser
+            and b"dir=self._state_dir" not in browser
+            and b"tempfile.tempdir =" not in browser
+        ),
+        "profile_owner_and_link_validation": (
+            b"_PROFILE_OWNER_MARKER" in browser
+            and b"_PROFILE_SESSION_MARKER_SUFFIX" in browser
+            and b"class _OwnedProfileRoot" in browser
+            and b"class _OwnedProfile" in browser
+            and b"def _validate_root(" in browser
+            and b"def _validate_profile(" in browser
+            and b"def _directory_lstat(" in browser
+            and b"def _regular_lstat(" in browser
+            and b".lstat()" in browser
+            and b"stat.S_ISLNK(" in browser
+            and b"_FILE_ATTRIBUTE_REPARSE_POINT" in browser
+            and b"os.path.samestat(" in browser
+            and b"profile.path.parent != root.path" in browser
+            and b"root.path.parent != root.temp_parent" in browser
+            and b"root.profiles.get(profile.path.name) is not profile" in browser
+            and b"def _read_owned_marker(" in browser
+            and b"os.O_NOFOLLOW" in browser
+            and b"os.fstat(" in browser
+            and b"_PROFILE_MARKER_MAX_BYTES" in browser
+            and b"0o700" in browser
+        ),
+        "exact_fail_closed_profile_cleanup": (
+            b"def _remove_profile(" in browser
+            and b"def _remove_profile_root(" in browser
+            and b"shutil.rmtree(profile.path)" in browser
+            and b"_validate_profile(profile" in browser
+            and b"if _path_absent(profile.path):" in browser
+            and b"return False" in browser
+            and b"entries = tuple(root.path.iterdir())" in browser
+            and b"root.path.rmdir()" in browser
+            and not any(
+                marker in browser
+                for marker in (
+                    b"glob.glob(",
+                    b"glob.iglob(",
+                    b".glob(",
+                    b".rglob(",
+                    b"os.walk(",
+                    b"CODEBUDDY_SAFE_DELETE",
+                )
+            )
+        ),
         "loopback_random_cdp": (
             b"--remote-debugging-address=127.0.0.1" in browser
             and b"--remote-debugging-port=0" in browser
@@ -206,7 +259,9 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
                 b"network.getallcookies",
             )
         ),
-        "url_scoped_cookie_query": b'"urls": [COOKIE_SOURCE_URL]' in browser,
+        "url_scoped_cookie_query": (
+            browser.count(b'"urls": [COOKIE_SOURCE_URL]') >= 2
+        ),
         "required_cookie_pair": b'"a1"' in browser and b'"web_session"' in browser,
         "verified_before_persist": (
             b"data = candidate.get_user_me()" in adapter
@@ -246,6 +301,7 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
             b"terminate(" in browser
             and b"kill(" in browser
             and b"shutil.rmtree(" in browser
+            and b"_remove_profile_root(" in browser
             and b"finally:" in browser
         ),
         "no_dynamic_import": (
@@ -423,7 +479,7 @@ def build_evidence(root: Path, *, container_image: str | None = None) -> dict[st
             "browser_login_control": "fixed-argv-loopback-random-cdp",
             "collection_json_response_bytes": 4 * 1024 * 1024,
             "browser_login_cookie_scope": "https://edith.xiaohongshu.com/api/sns/web/v2/user/me",
-            "browser_login_profile": "temporary-isolated-delete-on-terminal-state",
+            "browser_login_profile": "owned-system-temp-dedicated-root-exact-delete",
         },
         "checks": checks,
         "result": "passed" if all(item["passed"] for item in checks) else "failed",

@@ -24,6 +24,7 @@ _RETIRED_PROJECT = "Spider" + "_XHS"
 _RETIRED_IMPORT = "xhs_" + "utils.xhs_core"
 _RETIRED_PATH = _RETIRED_ROOT + "/spider_" + "xhs"
 _RETIRED_COMMIT = "2030f5d4454e556ad7a9" + "caa83b3ec532d4df20c7"
+_HOST_SAFE_DELETE_KEY = "CODE" + "BUDDY_SAFE_DELETE_ROOT"
 
 
 def _write_zip(path: Path, entries: list[tuple[str, bytes]]) -> None:
@@ -110,6 +111,20 @@ def test_payload_scanner_detects_high_confidence_secrets() -> None:
     assert "high-confidence Cookie/token value" in reasons
     assert "GitHub access token value" in reasons
     assert "private-key PEM material" in reasons
+
+
+def test_release_scanner_rejects_product_host_safe_delete_bypass() -> None:
+    payload = (
+        "import os\n"
+        f"os.environ.pop({_HOST_SAFE_DELETE_KEY!r}, None)\n"
+    ).encode()
+
+    reasons = {
+        finding.reason
+        for finding in _scan_payload(PurePosixPath("scripts/start.py"), payload)
+    }
+
+    assert "product code references or mutates host safe-delete controls" in reasons
 
 
 def test_historical_name_disclosure_is_limited_to_documentation() -> None:

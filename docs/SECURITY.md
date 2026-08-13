@@ -20,11 +20,11 @@ CrimsonFlux 是本地单用户源码预览，不是互联网服务。Web 服务�
 
 ## 隔离可见浏览器登录
 
-为避免要求普通用户打开开发者工具，原生桌面环境可以启动一次性、可见的官方网页登录窗口。它不是用户日常浏览器：应用从固定 Chrome/Edge/Chromium 路径 allowlist 选择程序，以固定参数创建权限 `0700` 的随机临时 Profile，只打开固定官方 URL；不接受自定义 executable、flags 或 URL，也不读取默认 Profile。Windows 安装根只通过系统 `SHGetKnownFolderPath` 获取，再拼接源码固定 suffix；不接受 `PATH`、Program Files 或 Local AppData 环境变量作为可执行文件根。
+为避免要求普通用户打开开发者工具，原生桌面环境可以启动一次性、可见的官方网页登录窗口。它不是用户日常浏览器：应用从固定 Chrome/Edge/Chromium 路径 allowlist 选择程序，以固定参数在操作系统临时目录的专用私有根中创建随机 Profile，只打开固定官方 URL；不接受自定义 executable、flags、URL 或 Profile 根，也不读取默认 Profile，Profile 不进入持久状态目录。专用根和 Profile 通过随机 nonce、私有 marker、创建时文件身份、直接父目录和非 symlink/junction/reparse 校验；POSIX 额外校验当前 UID 与 `0700` 权限边界。Windows 安装根只通过系统 `SHGetKnownFolderPath` 获取，再拼接源码固定 suffix；不接受 `PATH`、Program Files 或 Local AppData 环境变量作为可执行文件根。
 
 调试接口只绑定 `127.0.0.1` 随机端口。允许的 CDP 方法仅限 `Target.getTargets`、`Target.attachToTarget` 和 URL-scoped `Network.getCookies`；明确禁止 `Network.enable`，避免订阅不必要的网络事件与响应元数据。禁止执行页面 JavaScript、读取响应正文、DOM、截图、localStorage、浏览历史或浏览器全局 Cookie。禁止 `--no-sandbox`、`--disable-web-security` 和通配 remote origins。
 
-应用只查询固定 `/user/me` URL 可用的 Cookie，过滤为平台域，要求 `a1` 与 `web_session`，再交给既有 adapter 请求 `/user/me` 验证 `guest=false` 与非空用户 ID。验证后仍须先完成浏览器进程树与临时 Profile cleanup barrier 才能保存凭证；清理失败、取消或超时都必须阻止保存。Windows 只可按本次启动的 owned PID 调用系统 `taskkill /PID ... /T /F`，禁止按进程名或外部 PID 结束用户浏览器。
+应用只查询固定 `/user/me` URL 可用的 Cookie，过滤为平台域，要求 `a1` 与 `web_session`，再交给既有 adapter 请求 `/user/me` 验证 `guest=false` 与非空用户 ID。验证后仍须先完成浏览器进程树与临时 Profile cleanup barrier 才能保存凭证；清理只能作用于本会话重新验证归属的精确路径，禁止 glob、shell 或外部删除工具。清理 API 抛错或目标仍存在、取消或超时都必须阻止保存并保留引用重试。产品不得读取、清除或修改 `CODEBUDDY_SAFE_DELETE_*` 等宿主安全变量，也不得绕过 WorkBuddy 的删除拦截。Windows 只可按本次启动的 owned PID 调用系统 `taskkill /PID ... /T /F`，禁止按进程名或外部 PID 结束用户浏览器。
 
 Docker、无 GUI 环境或未找到 allowlist 浏览器时自动登录明确不可用，用户仍可主动使用手动 Cookie 导入。不得回退到默认 Profile、任意 executable、shell、危险 flags 或更宽的调试能力。完整边界见 [G1_SECURITY.md](G1_SECURITY.md)。
 

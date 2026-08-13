@@ -129,7 +129,14 @@ _FORBIDDEN_CANONICAL_BROWSER_RE = re.compile(
 _DYNAMIC_BRIDGES = frozenset(
     {"execjs", "js2py", "playwright", "py_mini_racer", "pyppeteer", "selenium"}
 )
+_HOST_SAFE_DELETE_PREFIX = "CODE" + "BUDDY_SAFE_DELETE"
+_DELETE_HELPER_NAMES = frozenset(
+    {"cmd", "cmd.exe", "del", "erase", "powershell", "powershell.exe", "pwsh", "rm", "rmdir"}
+)
 _CANONICAL_BROWSER_LOGIN = PurePosixPath("src/xhs_insight/browser_login.py")
+_RELEASE_POLICY_PATHS = frozenset(
+    {PurePosixPath("scripts/scan_release.py"), PurePosixPath("scripts/verify_g1.py")}
+)
 _HISTORICAL_DISCLOSURE_PATHS = frozenset(
     {
         "README.md",
@@ -250,6 +257,62 @@ def _qualified_name(node: ast.AST) -> str | None:
     return None
 
 
+def _references_state_dir(node: ast.AST) -> bool:
+    return any(
+        (isinstance(item, ast.Name) and item.id == "state_dir")
+        or (isinstance(item, ast.Attribute) and item.attr == "state_dir")
+        for item in ast.walk(node)
+    )
+
+
+def _literal_command_name(node: ast.Call) -> str | None:
+    if not node.args or not isinstance(node.args[0], (ast.List, ast.Tuple)):
+        return None
+    values = node.args[0].elts
+    if not values or not isinstance(values[0], ast.Constant):
+        return None
+    value = values[0].value
+    if not isinstance(value, str):
+        return None
+    return PurePosixPath(value.replace("\\", "/")).name.casefold()
+
+
+def _constant_string(node: ast.AST | None) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _constant_string(node.left)
+        right = _constant_string(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _safe_delete_key(node: ast.AST | None) -> bool:
+    value = _constant_string(node)
+    return value is not None and value.upper().startswith(_HOST_SAFE_DELETE_PREFIX)
+
+
+def _mutates_host_safe_delete(node: ast.AST) -> bool:
+    if isinstance(node, ast.Call):
+        name = _qualified_name(node.func) or ""
+        if name in {"os.unsetenv", "os.environ.pop", "os.environ.__delitem__"}:
+            return bool(node.args) and _safe_delete_key(node.args[0])
+        if name.endswith(".pop") or name.endswith(".__delitem__"):
+            return bool(node.args) and _safe_delete_key(node.args[0])
+    targets: list[ast.AST] = []
+    if isinstance(node, (ast.Delete, ast.Assign)):
+        targets = list(node.targets)
+    elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+        targets = [node.target]
+    return any(
+        isinstance(target, ast.Subscript)
+        and _qualified_name(target.value) == "os.environ"
+        and _safe_delete_key(target.slice)
+        for target in targets
+    )
+
+
 def _python_security_findings(relative: PurePosixPath, payload: bytes) -> list[Finding]:
     path = relative.as_posix()
     try:
@@ -266,6 +329,19 @@ def _python_security_findings(relative: PurePosixPath, payload: bytes) -> list[F
     if imported_roots & _DYNAMIC_BRIDGES:
         findings.append(Finding(path, "browser automation or dynamic code bridge import"))
 
+    if (
+        relative.parts
+        and relative.parts[0] in {"scripts", "src"}
+        and relative not in _RELEASE_POLICY_PATHS
+        and any(
+            _mutates_host_safe_delete(node) or _safe_delete_key(node)
+            for node in ast.walk(tree)
+        )
+    ):
+        findings.append(
+            Finding(path, "product code references or mutates host safe-delete controls")
+        )
+
     if relative.parts[:2] == ("src", "xhs_insight"):
         forbidden_calls = {"ev" + "al", "ex" + "ec", "com" + "pile", "importlib.import_module"}
         for node in ast.walk(tree):
@@ -278,6 +354,13 @@ def _python_security_findings(relative: PurePosixPath, payload: bytes) -> list[F
 
     if relative == _CANONICAL_BROWSER_LOGIN:
         for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(_qualified_name(target) == "tempfile.tempdir" for target in targets):
+                    findings.append(
+                        Finding(path, "canonical browser login overrides the system temp root")
+                    )
+                    break
             if isinstance(node, ast.Subscript) and _qualified_name(node.value) == "os.environ":
                 findings.append(
                     Finding(
@@ -289,6 +372,16 @@ def _python_security_findings(relative: PurePosixPath, payload: bytes) -> list[F
             if not isinstance(node, ast.Call):
                 continue
             call_name = _qualified_name(node.func) or ""
+            if call_name in {"tempfile.mkdtemp", "tempfile.TemporaryDirectory"}:
+                directory = next(
+                    (keyword.value for keyword in node.keywords if keyword.arg == "dir"),
+                    None,
+                )
+                if directory is not None and _references_state_dir(directory):
+                    findings.append(
+                        Finding(path, "browser profile is allocated under persistent state")
+                    )
+                    break
             if call_name in {
                 "os.getenv",
                 "os.get_exec_path",
@@ -302,10 +395,24 @@ def _python_security_findings(relative: PurePosixPath, payload: bytes) -> list[F
                     )
                 )
                 break
+            if (
+                call_name in {"glob.glob", "glob.iglob", "os.walk"}
+                or call_name.endswith((".glob", ".rglob"))
+                or (isinstance(node.func, ast.Attribute) and node.func.attr in {"glob", "rglob"})
+            ):
+                findings.append(
+                    Finding(path, "canonical browser cleanup uses broad path enumeration")
+                )
+                break
             if call_name in {"os.system", "os.popen"}:
                 findings.append(Finding(path, "canonical browser login uses a shell launcher"))
                 break
             if call_name in {"subprocess.Popen", "subprocess.run", "subprocess.call"}:
+                if _literal_command_name(node) in _DELETE_HELPER_NAMES:
+                    findings.append(
+                        Finding(path, "canonical browser cleanup invokes an external delete helper")
+                    )
+                    break
                 shell_keywords = [
                     keyword
                     for keyword in node.keywords
@@ -351,6 +458,16 @@ def _scan_payload(relative: PurePosixPath, payload: bytes) -> list[Finding]:
     if _GITHUB_TOKEN_RE.search(payload):
         findings.append(Finding(path, "GitHub access token value"))
     suffix = relative.suffix.casefold()
+    if (
+        relative.parts
+        and relative.parts[0] in {"scripts", "src"}
+        and relative not in _RELEASE_POLICY_PATHS
+        and suffix != ".py"
+        and _HOST_SAFE_DELETE_PREFIX.encode("ascii") in payload.upper()
+    ):
+        findings.append(
+            Finding(relative.as_posix(), "product code references or mutates host safe-delete controls")
+        )
     if suffix in {".cjs", ".js", ".mjs"} and _DYNAMIC_JS_RE.search(payload):
         findings.append(Finding(path, "dynamic JavaScript execution primitive"))
     if (

@@ -15,7 +15,7 @@ G1 要证明这条便利路径不会控制用户日常浏览器资料、执行�
         ▼
 从固定操作系统 allowlist 选择 Chrome / Edge / Chromium
         ▼
-创建权限 0700 的随机临时 Profile
+在操作系统临时目录创建专用私有根与随机临时 Profile
         ▼
 固定 argv 启动可见窗口
   ├─ 固定官方 URL：https://www.xiaohongshu.com/explore
@@ -49,7 +49,8 @@ Cookie 的唯一 CDP 查询范围是：
 
 - 仅允许规范模块 `src/xhs_insight/browser_login.py` 启动或控制浏览器；其他产品模块出现浏览器自动化/CDP 标记即发布阻断。
 - 只从按操作系统审计的 Chrome、Edge、Chromium 固定路径中选择可执行文件；Windows 根目录必须由 `SHGetKnownFolderPath` 取得并拼接源码固定的 vendor suffix，不能读取 `PATH`、`PROGRAMFILES`、`PROGRAMFILES(X86)`、`LOCALAPPDATA` 或其他环境变量。Known Folder API 失败时自动登录 fail closed。禁止任意路径、PATH 注入、下载浏览器或自定义 executable。
-- 每次登录创建全新的随机临时 `--user-data-dir`，权限为 `0700`；禁止读取、复制或挂载用户默认 Profile。
+- 原生三平台都必须在 `tempfile` 返回的操作系统临时目录下创建 CrimsonFlux 专用私有根，再为每次登录原子创建随机 `--user-data-dir`；不得把 Profile 放入持久 `state_dir`，不得接受 UI、配置或环境变量指定 Profile 根，也不得覆盖 `tempfile.tempdir`。
+- 专用根和 Profile 必须验证为本进程创建并持续登记的真实目录：校验随机 nonce、私有 ownership marker、创建时文件身份、直接父目录、固定名称和非 symlink/junction/reparse。POSIX 还要求当前 UID 且权限不超过 `0700`。仅有名称前缀不能证明目录归属。
 - CDP 只监听 `127.0.0.1`，使用浏览器分配的随机端口；严格校验 `DevToolsActivePort` 内容、端口范围和回环调试地址。
 - `subprocess` 只接受固定 argv 列表，`shell=False`，stdout/stderr 丢弃；Cookie 不进入 argv、环境变量、工作目录或输出。
 - Windows 关闭窗口时只能对本次 `Popen` 返回的正整数 PID 调用系统目录中的 `taskkill.exe /PID <pid> /T /F`；禁止 `/IM`、进程名、通配符或任何外部 PID。调用必须 `shell=False`、输入输出丢弃且有严格超时，失败后只允许对同一 owned `Popen` 做有界 `kill/wait`。
@@ -81,7 +82,9 @@ CDP 消息 ID、method、sessionId、JSON 深度、单条消息和累计输入�
 
 候选值仅在内存中交给 `Backend.import_cookie`。`RednoteAdapter.verify_cookie` 必须请求固定 `/user/me`，验证 `guest is false` 和非空 `user_id`。随后必须先完成关闭 CDP、终止本次浏览器进程树和删除临时 Profile 的 cleanup barrier，才能进入 commit guard。commit guard 使用同一会话锁将最终取消/deadline 检查、加密持久化和 `committed` 标记线性化：取消或 deadline 先取得锁时不得保存；持久化先取得锁且成功时，迟到的取消不得把成功改写为失败。清理失败必须阻止保存并保留引用供再次清理。
 
-每个终止路径都必须：关闭 CDP socket、终止浏览器；必要时有界等待后 kill；清空进程/端口/会话/Cookie 引用；删除临时 Profile。删除失败必须返回脱敏错误并记录不含路径和凭证的本地错误码，不能把残留 Profile 当作可恢复会话。
+每个终止路径都必须：关闭 CDP socket、终止浏览器；必要时有界等待后 kill；清空进程/端口/会话/Cookie 引用；只删除本会话登记且再次通过 ownership/identity 校验的精确 Profile 路径。禁止 glob、递归扫描临时根、shell、`rm`、PowerShell 或其他删除回退。删除 API 抛错或返回后目标仍存在，都必须 fail closed：返回脱敏错误、阻止 Cookie 持久化并保留引用供用户重试，不能把残留 Profile 当作可恢复登录态。
+
+宿主工具可能包装 Python 文件删除操作。产品不得清除或修改 `CODEBUDDY_SAFE_DELETE_*` 等宿主安全变量，也不得绕开其删除拦截；WorkBuddy shim 拒绝或静默不删除时，与普通清理失败使用同一 fail-closed 路径。本版本不自动扫描或回收陈旧临时目录，避免以名称前缀误删非本进程资产。
 
 ## 固定 Python 签名边界
 
