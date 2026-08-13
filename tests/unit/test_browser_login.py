@@ -300,6 +300,9 @@ def test_session_initialization_does_not_enable_network_events_and_cookie_read_s
         def terminate(self) -> None:
             self.running = False
 
+        def kill(self) -> None:
+            self.running = False
+
         def wait(self, timeout: float) -> int:
             assert timeout > 0
             return 0
@@ -410,13 +413,10 @@ def test_windows_close_uses_bounded_taskkill_tree_before_fallback(
     _terminate_browser_process(process)  # type: ignore[arg-type]
 
     taskkill_event = next(event for event in events if isinstance(event, tuple) and event[0] == "taskkill")
-    assert taskkill_event[1] == [
-        "C:/Windows/System32/taskkill.exe",
-        "/PID",
-        "4242",
-        "/T",
-        "/F",
-    ]
+    assert str(taskkill_event[1][0]).replace("\\", "/") == (
+        "C:/Windows/System32/taskkill.exe"
+    )
+    assert taskkill_event[1][1:] == ["/PID", "4242", "/T", "/F"]
     assert taskkill_event[2]["shell"] is False
     assert taskkill_event[2]["timeout"] == 12.0
     assert taskkill_event[2]["stdin"] is subprocess.DEVNULL
