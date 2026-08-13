@@ -73,6 +73,10 @@
       <symbol id="icon-play" viewBox="0 0 24 24">
         <path d="m9 6 9 6-9 6V6Z"/>
       </symbol>
+      <symbol id="icon-browser" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="16" rx="3"/>
+        <path d="M3 9h18M7 6.5h.01M10 6.5h.01"/>
+      </symbol>
       <symbol id="icon-qr" viewBox="0 0 24 24">
         <rect x="3.5" y="3.5" width="6" height="6" rx="1"/>
         <rect x="14.5" y="3.5" width="6" height="6" rx="1"/>
@@ -121,37 +125,37 @@
             <span class="hero-product-en">CrimsonFlux</span>
           </h1>
           <p class="hero-copy">
-            面向内容创作者的本地数据工具，按关键词或主页整理公开内容，并导出 CSV、JSONL 文件。
+            面向内容创作者的本地数据工具，按关键词或主页整理公开内容，并导出表格和通用数据文件。
           </p>
           <div class="hero-trust" aria-label="产品边界">
             <span><span class="trust-glyph" aria-hidden="true">🔒</span>本地运行</span>
             <span><span class="trust-glyph" aria-hidden="true">⚡️</span>仅限公开内容</span>
-            <span class="is-accent"><span class="trust-glyph" aria-hidden="true">📂</span>CSV · JSONL 导出</span>
+            <span class="is-accent"><span class="trust-glyph" aria-hidden="true">📂</span>表格 · 通用数据</span>
           </div>
         </div>
 
         <aside id="workflow" class="workflow-card" aria-label="使用流程" data-flow-state="connect">
           <div class="workflow-card-heading">
             <span class="workflow-label">LOCAL DATA FLOW</span>
-            <strong>三步拿到标准数据</strong>
+            <strong>三步下载整理结果</strong>
           </div>
           <ol class="workflow-list">
             <li data-workflow-step="connect" class="is-current">
               <span>01</span>
-              <div><strong>连接账号</strong><small>验证并加密保存登录态</small></div>
+              <div><strong>登录账号</strong><small>登录信息只保存在本机</small></div>
             </li>
             <li data-workflow-step="scope">
               <span>02</span>
-              <div><strong>设置范围</strong><small>关键词结果或主页公开内容</small></div>
+              <div><strong>选择内容</strong><small>搜索主题或粘贴主页链接</small></div>
             </li>
             <li data-workflow-step="export">
               <span>03</span>
-              <div><strong>下载文件</strong><small>CSV · JSONL · manifest</small></div>
+              <div><strong>下载文件</strong><small>表格、通用数据与任务说明</small></div>
             </li>
           </ol>
           <div class="workflow-output">
             <svg class="icon" aria-hidden="true"><use href="#icon-file"></use></svg>
-            <span><strong>标准化导出</strong><small>保留质量与完成度说明</small></span>
+            <span><strong>拿到可用文件</strong><small>同时附上数量与完成情况</small></span>
           </div>
         </aside>
       </section>
@@ -177,29 +181,37 @@
             <div class="browser-login-layout">
               <div class="browser-login-primary">
                 <div id="browser-login-visual" class="browser-login-visual" data-state="idle">
-                  <div class="qr-code-frame">
-                    <img id="browser-login-qr"
-                         class="browser-login-qr"
-                         alt="平台登录二维码，请使用平台官方 App 扫描"
-                         width="220" height="220" hidden>
-                    <div id="browser-login-placeholder" class="browser-login-placeholder">
-                      <span class="qr-placeholder-icon" aria-hidden="true">
-                        <svg class="icon"><use href="#icon-qr"></use></svg>
-                      </span>
-                      <span id="browser-login-placeholder-text">点击获取登录二维码</span>
+                  <div class="official-browser-frame" aria-hidden="true">
+                    <div class="official-browser-bar">
+                      <span></span><span></span><span></span>
+                      <i>官方登录页面</i>
                     </div>
+                    <div class="official-browser-body">
+                      <span class="official-browser-icon">
+                        <svg class="icon"><use href="#icon-browser"></use></svg>
+                      </span>
+                      <span class="official-browser-line is-strong"></span>
+                      <span class="official-browser-line"></span>
+                      <span class="official-browser-button"></span>
+                    </div>
+                  </div>
+                  <div id="browser-login-placeholder" class="browser-login-placeholder">
+                    <span class="browser-placeholder-icon" aria-hidden="true">
+                      <svg class="icon"><use href="#icon-arrow"></use></svg>
+                    </span>
+                    <span id="browser-login-placeholder-text">点击后会打开临时官方窗口</span>
                   </div>
                   <span class="secure-orbit" aria-hidden="true"><svg class="icon"><use href="#icon-shield"></use></svg></span>
                 </div>
                 <div class="browser-login-copy">
                   <p class="section-kicker">推荐方式</p>
-                  <h3>扫码连接平台账号</h3>
-                  <p>登录二维码会直接显示在这里。打开平台官方 App 扫一扫，确认后页面会自动完成登录。</p>
+                  <h3>打开官方网页登录</h3>
+                  <p>程序会打开一个独立的临时 Chrome 或 Edge 窗口。你只需按官方页面提示扫码、确认或完成短信验证，成功后这里会自动连接。</p>
                   <button id="browser-login" class="button button-primary button-large" type="button">
-                    <svg class="icon" aria-hidden="true"><use href="#icon-qr"></use></svg>
-                    <span>获取登录二维码</span>
+                    <svg class="icon" aria-hidden="true"><use href="#icon-browser"></use></svg>
+                    <span>打开官方网页登录</span>
                   </button>
-                  <small id="browser-login-capability" class="muted">正在检查扫码能力…</small>
+                  <small id="browser-login-capability" class="muted">正在检查本机浏览器…</small>
                 </div>
               </div>
 
@@ -207,9 +219,9 @@
                 <div>
                   <span id="browser-login-status" class="status-pill status-running">
                     <span class="status-dot" aria-hidden="true"></span>
-                    <span>正在生成</span>
+                    <span>正在打开</span>
                   </span>
-                  <p id="browser-login-message" role="status" aria-live="polite" aria-atomic="true">正在生成登录二维码…</p>
+                  <p id="browser-login-message" role="status" aria-live="polite" aria-atomic="true">正在打开临时官方登录窗口…</p>
                   <span id="browser-login-countdown" class="browser-login-countdown" aria-hidden="true" hidden></span>
                 </div>
                 <button id="cancel-browser-login" class="button button-secondary button-small" type="button">取消</button>
@@ -217,14 +229,14 @@
 
               <div class="browser-security-boundary">
                 <svg class="icon" aria-hidden="true"><use href="#icon-lock"></use></svg>
-                <p><strong>二维码在本页完成，不读取日常浏览器资料</strong><span>登录成功后，本地服务只保存内容整理必需的白名单 Cookie，并在账号验证通过后加密落盘。</span></p>
+                <p><strong>不会读取你日常浏览器里的账号资料</strong><span>登录发生在一次性的临时窗口中。验证成功后只保存运行所需的登录状态，并立即关闭窗口、删除临时资料。</span></p>
               </div>
 
               <details id="manual-login" class="manual-login-disclosure">
                 <summary>
                   <span>
-                    <strong id="manual-login-title">扫码不可用？手动导入 Cookie</strong>
-                    <small id="manual-login-subtitle">Docker 与无图形界面环境使用此方式</small>
+                    <strong id="manual-login-title">窗口打不开？手动导入登录状态</strong>
+                    <small id="manual-login-subtitle">Docker 或没有图形界面时使用</small>
                   </span>
                   <svg class="icon" aria-hidden="true"><use href="#icon-chevron"></use></svg>
                 </summary>
@@ -233,8 +245,8 @@
                      role="status" aria-live="polite" aria-atomic="true" hidden>
                   <svg class="icon" aria-hidden="true"><use href="#icon-alert"></use></svg>
                   <p>
-                    <strong>扫码确认已完成，但还需要网页验证</strong>
-                    <span>当前安全模式无法在本页自动完成。请先在官方网页完成登录，再从下方导入 Cookie。</span>
+                    <strong>自动网页登录暂时不可用</strong>
+                    <span>你仍可在普通浏览器完成官方登录，再按下面的步骤安全导入登录状态。</span>
                   </p>
                 </div>
                 <div class="manual-login-content">
@@ -353,9 +365,9 @@
             <div class="panel-title-group">
               <span class="step-number" aria-hidden="true">02</span>
               <div>
-                <p class="section-kicker">内容设置</p>
-                <h2 id="collect-title">选择这次要整理的范围</h2>
-                <p class="section-description">同一时间运行一个任务，其余任务会自动排队。</p>
+                <p class="section-kicker">选择内容</p>
+                <h2 id="collect-title">这次想整理什么？</h2>
+                <p class="section-description">选择一种方式并填写内容；如果已有任务在运行，新任务会接着排队。</p>
               </div>
             </div>
           </div>
@@ -366,7 +378,7 @@
               <span class="tab-icon" aria-hidden="true">
                 <svg class="icon"><use href="#icon-search"></use></svg>
               </span>
-              <span class="tab-copy"><strong>关键词整理</strong><small>指定目标数量，适合主题调研</small></span>
+              <span class="tab-copy"><strong>按主题搜索</strong><small>输入想了解的主题和数量</small></span>
               <span class="tab-check" aria-hidden="true"><svg class="icon"><use href="#icon-check"></use></svg></span>
             </button>
             <button id="user-tab" class="source-tab" type="button" role="tab"
@@ -374,7 +386,7 @@
               <span class="tab-icon" aria-hidden="true">
                 <svg class="icon"><use href="#icon-user"></use></svg>
               </span>
-              <span class="tab-copy"><strong>指定主页整理</strong><small>遍历当前可见的全部公开内容</small></span>
+              <span class="tab-copy"><strong>整理一个主页</strong><small>粘贴主页链接，尽量找齐可见内容</small></span>
               <span class="tab-check" aria-hidden="true"><svg class="icon"><use href="#icon-check"></use></svg></span>
             </button>
           </div>
@@ -390,26 +402,26 @@
                     <small>按搜索结果顺序整理；结果会受登录账号、时间与平台返回影响。</small>
                   </label>
                   <label class="field">
-                    <span>目标数量</span>
+                    <span>想要多少条</span>
                     <input id="keyword-limit" name="limit" type="number" min="1" max="1000" value="50" required>
-                    <small id="keyword-limit-help">实际条数可能因去重、无更多结果或风控而少于目标值。</small>
+                    <small id="keyword-limit-help">如果没有足够结果，最终数量可能会更少。</small>
                   </label>
                 </div>
               </div>
 
               <div id="user-panel" class="source-panel" role="tabpanel" aria-labelledby="user-tab" hidden>
                 <label class="field">
-                  <span>用户主页完整地址</span>
+                  <span>主页链接</span>
                   <input id="profile-url" name="profile_url" type="url" inputmode="url"
                          autocomplete="off" spellcheck="false"
                          placeholder="https://www.xiaohongshu.com/user/profile/...">
-                  <small>只接受 xiaohongshu.com 的用户主页地址，不支持昵称搜索。</small>
+                  <small>请从浏览器地址栏复制完整主页链接；暂不支持输入昵称查找。</small>
                 </label>
                 <label class="acknowledgement">
                   <input id="user-all-ack" type="checkbox">
                   <span>
-                    <strong>我知道这会遍历该用户当前可见的全部公开笔记</strong>
-                    <small>“全部”不是永久完整保证：私密、删除、不可见及平台未返回的笔记不在结果内。</small>
+                    <strong>尽量整理这个主页当前可见的全部内容</strong>
+                    <small>私密、已删除、看不到或平台没有返回的内容不会出现在结果里。</small>
                   </span>
                 </label>
               </div>
@@ -417,47 +429,47 @@
 
             <fieldset class="preset-section">
               <legend class="fieldset-heading">
-                <span class="fieldset-title">选择导出内容</span>
-                <span class="fieldset-description">核心字段始终包含内容 ID、标题、URL 与整理时间</span>
+                <span class="fieldset-title">想在文件里保存哪些信息？</span>
+                <span class="fieldset-description">无论怎么选，都会保留标题、作者、链接和整理时间</span>
               </legend>
               <div class="preset-grid">
                 <label class="preset-card">
                   <input type="radio" name="preset" value="basic" checked>
                   <span class="preset-body">
                     <span class="preset-icon"><svg class="icon" aria-hidden="true"><use href="#icon-file"></use></svg></span>
-                    <span class="preset-title"><strong>基础字段</strong><em>推荐</em></span>
-                    <small>标题、链接、来源位置与作者；请求少、完成快。</small>
-                    <span class="preset-meta">列表数据 · 最快</span>
+                    <span class="preset-title"><strong>快速版</strong><em>推荐</em></span>
+                    <small>保存标题、作者和链接，不逐条打开内容，速度最快。</small>
+                    <span class="preset-meta">适合先看看结果</span>
                   </span>
                 </label>
                 <label class="preset-card">
                   <input type="radio" name="preset" value="full">
                   <span class="preset-body">
                     <span class="preset-icon"><svg class="icon" aria-hidden="true"><use href="#icon-download"></use></svg></span>
-                    <span class="preset-title"><strong>完整字段</strong></span>
-                    <small>正文、标签、互动指标与媒体链接；逐条请求详情。</small>
-                    <span class="preset-meta">逐条详情 · 信息最全</span>
+                    <span class="preset-title"><strong>完整版</strong></span>
+                    <small>再保存正文、标签、点赞收藏等；内容越多，等待越久。</small>
+                    <span class="preset-meta">信息更多 · 等待更久</span>
                   </span>
                 </label>
                 <label class="preset-card">
                   <input type="radio" name="preset" value="custom">
                   <span class="preset-body">
                     <span class="preset-icon"><svg class="icon" aria-hidden="true"><use href="#icon-check"></use></svg></span>
-                    <span class="preset-title"><strong>自定义字段</strong></span>
-                    <small>只整理需要的字段组；详情字段仍会逐条请求。</small>
-                    <span class="preset-meta">按需选择 · 更灵活</span>
+                    <span class="preset-title"><strong>自己选择</strong></span>
+                    <small>只勾选你真正需要的信息；部分信息仍需逐条读取。</small>
+                    <span class="preset-meta">少一些不需要的内容</span>
                   </span>
                 </label>
               </div>
 
               <div id="custom-fields" class="custom-fields" hidden>
-                <p>选择至少一个字段组</p>
+                <p>至少勾选一类信息</p>
                 <div class="check-grid">
-                  <label><input type="checkbox" name="field_group" value="author" checked> 作者</label>
-                  <label><input type="checkbox" name="field_group" value="body"> 正文与时间</label>
-                  <label><input type="checkbox" name="field_group" value="tags"> 标签</label>
-                  <label><input type="checkbox" name="field_group" value="metrics"> 互动指标</label>
-                  <label><input type="checkbox" name="field_group" value="media"> 媒体链接</label>
+                  <label title="作者名称、作者 ID 和主页链接"><input type="checkbox" name="field_group" value="author" checked> 作者信息</label>
+                  <label title="正文、发布时间和更新时间"><input type="checkbox" name="field_group" value="body"> 正文和发布时间</label>
+                  <label title="内容中公开显示的话题标签"><input type="checkbox" name="field_group" value="tags"> 内容标签</label>
+                  <label title="公开显示的点赞、收藏、评论和分享数量"><input type="checkbox" name="field_group" value="metrics"> 点赞、收藏和评论数</label>
+                  <label title="公开图片和视频的链接；不会下载媒体文件"><input type="checkbox" name="field_group" value="media"> 图片和视频链接</label>
                 </div>
               </div>
             </fieldset>
@@ -467,9 +479,9 @@
                 <svg class="icon"><use href="#icon-clock"></use></svg>
               </span>
               <div>
-                <span class="estimate-label">请求与时间预估</span>
+                <span class="estimate-label">大概需要多久</span>
                 <strong>预计耗时：约 1–3 分钟</strong>
-                <small>估算仅用于安排等待时间，网络、风控和平台响应会造成较大波动。</small>
+                <small>这只是大概时间，网络速度和平台响应都会影响等待时长。</small>
               </div>
             </div>
 
@@ -479,7 +491,7 @@
                 <svg class="icon" aria-hidden="true"><use href="#icon-play"></use></svg>
                 <span>请先完成登录</span>
               </button>
-              <p class="muted compact">默认间隔请求，不提供代理轮换或风控绕过。</p>
+              <p class="muted compact">程序会主动放慢速度；遇到访问限制时会暂停并保留已有结果。</p>
             </div>
           </form>
         </section>
@@ -489,9 +501,9 @@
             <div class="panel-title-group">
               <span class="step-number" aria-hidden="true">03</span>
               <div>
-                <p class="section-kicker">任务中心</p>
-                <h2 id="jobs-title">查看进度并下载数据</h2>
-                <p class="section-description">页面刷新或服务重启后，任务记录仍会保留。</p>
+                <p class="section-kicker">进度与下载</p>
+                <h2 id="jobs-title">结果会出现在这里</h2>
+                <p class="section-description">可以放心刷新页面；重新启动服务后，进度记录也会保留。</p>
               </div>
             </div>
             <div class="connection-group panel-actions">
@@ -509,8 +521,8 @@
           <div id="jobs-empty" class="empty-state">
             <span class="empty-icon" aria-hidden="true"><svg class="icon"><use href="#icon-inbox"></use></svg></span>
             <span class="ready-label">READY</span>
-            <strong>等待第一项整理任务</strong>
-            <p>完成上面的设置并开始整理，进度与 CSV、JSONL、manifest 下载会出现在这里。</p>
+            <strong>还没有整理任务</strong>
+            <p>完成上面的设置并开始后，这里会显示进度，并提供表格、通用数据和任务说明文件。</p>
           </div>
           <div id="jobs-list" class="jobs-list"></div>
         </section>
@@ -535,19 +547,19 @@
         </button>
         <span class="dialog-icon" aria-hidden="true"><svg class="icon"><use href="#icon-download"></use></svg></span>
         <p class="section-kicker">需要再次确认</p>
-        <h2 id="confirm-title">是否逐条补全所选详情？</h2>
+        <h2 id="confirm-title">要继续获取更多信息吗？</h2>
         <p id="confirm-summary"></p>
         <div class="warning-box">
           <svg class="icon" aria-hidden="true"><use href="#icon-clock"></use></svg>
           <div>
             <strong id="confirm-estimate">预计耗时正在计算</strong>
-            <p>详情请求会显著增加运行时间与触发平台限流的概率。取消不会删除已经列出的基础数据。</p>
+            <p>程序需要逐条打开内容，因此等待更久，也可能被平台暂时限制访问。选择快速导出不会丢掉已经找到的内容。</p>
           </div>
         </div>
         <div class="dialog-actions">
           <button class="button button-quiet" value="cancel">稍后决定</button>
-          <button id="export-basic" class="button button-secondary" type="button">仅导出基础字段</button>
-          <button id="confirm-details" class="button button-primary" type="button">确认并继续</button>
+          <button id="export-basic" class="button button-secondary" type="button">只导出标题和链接</button>
+          <button id="confirm-details" class="button button-primary" type="button">继续获取更多信息</button>
         </div>
       </form>
     </dialog>

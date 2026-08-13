@@ -13,7 +13,9 @@ CrimsonFlux 没有自建云端、模型服务、遥测或广告 SDK。真实采�
 - 本地生成的加密密钥；
 - 错误码和不含秘密的任务元数据。
 
-扫码不启动浏览器或创建 Profile。服务通过固定 HTTP 接口取得 QR value，在本地内存生成二维码 PNG；QR value、qr_id、code 和 PNG 不写入 SQLite、文件或日志。扫码完成、取消、失败、超时或服务退出时会清空这些内存值。
+原生桌面环境选择自动登录时，CrimsonFlux 会启动一个一次性、可见的官方网页登录窗口，并在状态目录下创建权限 `0700` 的随机临时浏览器 Profile。它不会读取或复制你的默认浏览器 Profile。应用只通过回环随机 CDP 端口读取固定 `/user/me` URL 可用的平台域 Cookie，不读取页面正文、表单、浏览历史、localStorage、响应正文或其他网站 Cookie。
+
+自动取得的 Cookie 只在内存中进入 `/user/me` 身份校验；校验成功后才加密保存。成功、取消、失败、超时、窗口关闭或服务退出时，应用会关闭 CDP 和临时浏览器并删除临时 Profile。异常断电可能留下临时目录；下次启动应只按自身命名和权限规则清理过期目录，不能扫描其他浏览器资料。Docker、无 GUI 环境或未找到固定 allowlist 浏览器时不启用自动登录。
 
 Docker 将其放在命名卷 `crimsonflux_state`。原生模式默认位置：
 
@@ -28,7 +30,7 @@ Docker 将其放在命名卷 `crimsonflux_state`。原生模式默认位置：
 ## 凭证处理
 
 - Cookie 和签名材料不属于用户导出字段。
-- 扫码成功后，服务必须用正式 session 替换匿名 visitor session，并通过固定 `/user/me` 确认 `guest=false` 后才保存 Cookie。平台响应中的 program/script 字段不得执行或保存；二维码由校验后的官方 QR URL 在本地生成，不保存原始响应体。
+- 自动登录或手动导入取得的 Cookie 都必须通过固定 `/user/me` 确认 `guest=false` 且用户 ID 非空后才保存。平台响应中的 program/script 字段不得执行或保存；CDP endpoint、临时 Profile 路径与浏览器 target 信息也不得持久化或写入日志。
 - 任务需要的私有 token 应加密存储，并在不再需要时删除。
 - 本地密钥与加密状态位于同一用户控制范围，不能替代操作系统账户和磁盘保护。
 - 不要分享状态卷、数据库、Cookie、`.env` 或未经检查的日志。

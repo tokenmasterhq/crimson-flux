@@ -1,8 +1,24 @@
 # CrimsonFlux 导出字段
 
-用户可下载 `notes.csv` 与 `notes.jsonl`。二者来自同一规范化记录集合；CSV 适合表格软件，JSONL 保留数组和空值类型。
+用户可下载 `notes.csv` 与 `notes.jsonl`。二者包含相同的笔记集合，但用途不同：
 
-## 核心字段
+- `notes.csv` 面向普通用户和表格软件，只保留阅读、筛选内容时有用的列；
+- `notes.jsonl` 面向程序处理，保留完整的规范化字段、数组和空值类型；
+- `manifest.json` 保存任务来源、完成情况、请求统计和两种文件的校验信息。
+
+CSV 不再重复输出 `schema_version`、`job_id`、`source_type`、`source_query`、`source_page`、`source_rank`。这些任务级或分页级信息仍保留在 JSONL 或 manifest 中，CSV 的行顺序就是原有结果顺序。
+
+## CSV 默认列
+
+固定列按以下顺序出现：
+
+1. `title`、`note_url`、`note_type`、`note_id`；
+2. 用户选择的作者、正文、标签、互动和媒体列；
+3. `collected_at`、`detail_status`、`detail_error_code`。
+
+未选择的可选信息不会生成空列。
+
+## JSONL 完整字段
 
 | 字段 | 含义 |
 |---|---|

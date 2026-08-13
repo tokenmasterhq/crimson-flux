@@ -28,15 +28,16 @@ python scripts/scan_release.py --archive dist/source
 
 任何命中都使 G0 失败。不要通过重写规则误删用户未知分支后直接强推；发布负责人应先在隔离副本验证目标历史与最终归档。
 
-## G1：固定 Python 签名与页面内扫码
+## G1：固定 Python 签名与隔离可见浏览器登录
 
 G1 证明产品只运行锁定、可审计的 Python 代码：
 
 - 签名只通过 `xhshow==0.2.0` 的固定公开 API；禁止运行时下载、动态 import、备用 signer 或未锁定 patch；
 - 平台响应中的 program/script 是不可信数据，不能进入 `eval`、`exec`、`compile`、subprocess、文件、数据库或日志；
-- 页面内扫码只使用固定 HTTPS endpoint，不启动浏览器、CDP、DevTools、WebSocket 调试或浏览器 Profile；
-- QR URL 只接受固定 HTTPS host，本地内存生成 PNG；图片 API 必须同源、认证、`image/png`、`private, no-store`；
-- 扫码成功后正式 session 必须非空且不同于 visitor session，并经 `/user/me` 确认 `success=true`、`guest=false` 后才可加密保存；
+- 浏览器登录只存在于规范模块；可执行文件、官方 URL 与 flags 固定，使用权限 `0700` 的随机临时 Profile，不读取默认 Profile；
+- CDP 只绑定回环随机端口，只允许最小 Target/Network 方法，并以固定 `/user/me` URL scope 调用 `Network.getCookies`；禁止页面执行、响应正文、localStorage 和全局 Cookie 读取；
+- 禁止 shell、自定义 executable/flags、`--no-sandbox`、`--disable-web-security` 及其他扩大权限的回退；
+- 自动取得的 Cookie 必须经同一 `/user/me` 路径确认 `guest=false`、用户 ID 非空后才可加密保存；所有终止路径关闭进程/CDP并删除临时 Profile；
 - 独立 security reviewer、真实低频扫码与采集 smoke、发布负责人共同批准。
 
 详细验收见 [G1_SECURITY.md](G1_SECURITY.md)。机器 evidence 必须来自同一 commit，并覆盖 Windows、macOS、Linux 和构建镜像：
@@ -46,7 +47,7 @@ python scripts/verify_g1.py --output dist/g1/g1-native.json
 python scripts/verify_g1.py --verify dist/g1/g1-native.json
 ```
 
-Evidence 只证明编码门禁通过，不能替代人工复核。无法证明时必须 fail closed，不得提供 fixture、伪登录、浏览器自动化或 `allow-unsafe` 绕过。
+Evidence 只证明编码门禁通过，不能替代人工复核。无法证明时必须 fail closed；可保留显式手动导入，但不得提供 fixture、伪登录、默认 Profile、任意浏览器自动化或 `allow-unsafe` 绕过。
 
 ## CI 与 GitHub Environment
 
@@ -85,7 +86,7 @@ python scripts/scan_release.py --archive dist/source
 |---|---|
 | G0 未通过 | 不公开仓库、归档、容器或 Release；先建立无旧对象的新历史并补齐许可记录 |
 | G1 未通过 | 健康状态为 `degraded`，真实登录/采集入口 fail closed，不提供替代 adapter |
-| 页面内扫码未通过 | 禁用扫码；不得回退到浏览器自动化或动态代码执行 |
+| 隔离浏览器登录未通过 | 禁用自动登录并保留显式手动导入；不得回退到默认 Profile、危险 flags、页面执行或动态代码执行 |
 | 单一平台 source 启动失败 | 不宣称支持该平台，继续内部修复 |
 | 凭证泄露、SSRF 或高危依赖 | 停止 Release，撤回受影响资产并轮换测试凭证 |
 | 平台接口不稳定 | 保留合法的部分导出并标记 incomplete，不增加绕过策略 |

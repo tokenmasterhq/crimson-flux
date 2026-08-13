@@ -17,8 +17,8 @@ from typing import Any
 from scan_release import scan_g1_tree, scan_git_history, scan_source, source_file_paths
 
 ROOT = Path(__file__).resolve().parents[1]
-POLICY_VERSION = "crimsonflux-g1-v6-independent-http"
-EVIDENCE_SCHEMA = "https://crimsonflux.local/schemas/g1-evidence-v6.json"
+POLICY_VERSION = "crimsonflux-g1-v7-isolated-visible-browser"
+EVIDENCE_SCHEMA = "https://crimsonflux.local/schemas/g1-evidence-v7.json"
 
 
 def _digest(payload: bytes) -> str:
@@ -114,81 +114,115 @@ def _python_only_check(root: Path) -> dict[str, Any]:
     }
 
 
-def _direct_qr_check(root: Path) -> dict[str, Any]:
+def _browser_login_check(root: Path) -> dict[str, Any]:
     browser_path = root / "src" / "xhs_insight" / "browser_login.py"
-    client_path = root / "src" / "xhs_insight" / "platform" / "client.py"
-    if not browser_path.is_file() or not client_path.is_file():
+    adapter_path = root / "src" / "xhs_insight" / "adapters" / "rednote" / "live.py"
+    if not browser_path.is_file() or not adapter_path.is_file():
         return {
-            "name": "direct_http_qr_contract",
+            "name": "isolated_visible_browser_login_contract",
             "passed": False,
-            "detail": "login or platform module missing",
+            "detail": "browser login or adapter module missing",
         }
     browser = browser_path.read_bytes()
-    client = client_path.read_bytes()
-    combined = browser + b"\n" + client
-    request_start = client.find(b"    def _request(")
-    request_end = client.find(b"    def login_activate(", request_start)
-    request_body = (
-        client[request_start:request_end]
-        if request_start >= 0 and request_end > request_start
-        else b""
-    )
-    merge_index = request_body.find(b"self._merge_cookies(response.cookies)")
-    classify_index = request_body.find(b"self._classify_response(response, operation)")
-    run_start = browser.find(b"    def _run(")
-    run_end = browser.find(b"\n\nBrowserLoginManager =", run_start)
-    run_body = (
-        browser[run_start:run_end]
-        if run_start >= 0 and run_end > run_start
-        else b""
-    )
-    identity_gate_index = run_body.find(b"if not _is_verified_identity(identity):")
-    import_index = run_body.find(b"result = self._import_cookie(")
+    adapter = adapter_path.read_bytes()
+    lowered = browser.lower()
+    login_url = b'https://www.xiaohongshu.com/explore'
+    cookie_source = b'https://edith.xiaohongshu.com/api/sns/web/v2/user/me'
     required = {
-        "direct_client": b"class DirectQrClient" in browser,
-        "manager": b"class DirectQrLoginManager" in browser,
-        "bounded_login_json": b"_MAX_LOGIN_RESPONSE_BYTES = 256 * 1024" in client,
-        "bounded_collection_json": (
-            b"_MAX_COLLECTION_RESPONSE_BYTES = 4 * 1024 * 1024" in client
+        "canonical_manager": b"class IsolatedBrowserLoginManager" in browser,
+        "official_login_url": login_url in browser,
+        "fixed_cookie_scope": cookie_source in browser,
+        "executable_allowlist": (
+            b"def _browser_candidates(" in browser
+            and b"def find_supported_browser(" in browser
         ),
-        "response_cookies_before_classification": (
-            merge_index >= 0 and classify_index > merge_index
+        "isolated_profile": b"tempfile.mkdtemp(" in browser and b"--user-data-dir=" in browser,
+        "profile_mode_0700": b"0o700" in browser and b"chmod(" in browser,
+        "loopback_random_cdp": (
+            b"--remote-debugging-address=127.0.0.1" in browser
+            and b"--remote-debugging-port=0" in browser
+            and b"DevToolsActivePort" in browser
         ),
-        "verified_nonguest_identity": (
-            b'return value.get("guest") is False '
-            b'and bool(str(value.get("user_id") or "").strip())' in browser
+        "fixed_launch_flags": all(
+            flag in browser
+            for flag in (
+                b"--no-first-run",
+                b"--no-default-browser-check",
+                b"--disable-sync",
+                b"--disable-extensions",
+                b"--new-window",
+            )
         ),
-        "identity_verified_before_import": (
-            identity_gate_index >= 0 and import_index > identity_gate_index
+        "no_shell": b"shell=True" not in browser and b"os.system(" not in browser,
+        "no_unsafe_flags": (
+            b"--no-sandbox" not in browser
+            and b"--disable-web-security" not in browser
+            and b"--remote-allow-origins=*" not in browser
         ),
-        "local_png": b"qrcode.QRCode(" in browser,
-        "fixed_signer_import": b"import xhshow" in client,
-        "fixed_search_origin": b'SEARCH_ORIGIN = "https://so.xiaohongshu.com"' in client,
-        "no_remote_program_surface": not any(
-            marker in combined.lower()
-            for marker in (b"scripting_code", b"websectiga", b"security_program")
+        "minimal_cdp": (
+            b"Target.getTargets" in browser
+            and b"Target.attachToTarget" in browser
+            and b"Network.enable" in browser
+            and b"Network.getCookies" in browser
         ),
-        "no_browser_process": b"subprocess" not in combined,
+        "no_page_execution_or_content": not any(
+            marker in lowered
+            for marker in (
+                b"runtime.evaluate",
+                b"runtime.callfunctionon",
+                b"getresponsebody",
+                b"localstorage",
+                b"sessionstorage",
+                b"storage.getcookies",
+                b"network.getallcookies",
+            )
+        ),
+        "url_scoped_cookie_query": b'"urls": [COOKIE_SOURCE_URL]' in browser,
+        "required_cookie_pair": b'"a1"' in browser and b'"web_session"' in browser,
+        "verified_before_persist": (
+            b"data = candidate.get_user_me()" in adapter
+            and b"if guest is not False:" in adapter
+            and b"account_id = str(data.get(" in adapter
+        ),
+        "terminal_cleanup": (
+            b"terminate(" in browser
+            and b"kill(" in browser
+            and b"shutil.rmtree(" in browser
+            and b"finally:" in browser
+        ),
         "no_dynamic_import": (
-            b"importlib.import_module" not in combined and b"__import__(" not in combined
+            b"importlib.import_module" not in browser and b"__import__(" not in browser
         ),
     }
     return {
-        "name": "direct_http_qr_contract",
+        "name": "isolated_visible_browser_login_contract",
         "passed": all(required.values()),
         "detail": required,
     }
 
 
-def _qr_api_check(root: Path) -> dict[str, Any]:
+def _browser_api_check(root: Path) -> dict[str, Any]:
     router = (root / "src" / "xhs_insight" / "api" / "router.py").read_bytes()
     app = (root / "src" / "xhs_insight" / "api" / "app.py").read_bytes()
+    status_start = router.find(b'    @router.get("/auth/browser/status")')
+    status_end = router.find(b"\n    @router.", status_start + 1)
+    status_body = (
+        router[status_start:status_end]
+        if status_start >= 0 and status_end > status_start
+        else b""
+    )
     markers = {
-        "fixed_route": b'@router.get("/auth/browser/qr")' in router,
-        "png_only": b'media_type="image/png"' in router,
-        "private_no_store": b'"private, no-store, max-age=0, must-revalidate"' in router,
-        "nosniff": b'"X-Content-Type-Options": "nosniff"' in router,
-        "manager_bytes_only": b"image, revision = manager.qr_image()" in router,
+        "start_route": b'@router.post("/auth/browser"' in router,
+        "status_route": b'@router.get("/auth/browser/status")' in router,
+        "cancel_route": b'@router.delete("/auth/browser")' in router,
+        "embedded_qr_fixed_disabled": (
+            b'@router.get("/auth/browser/qr")' in router
+            and b'"EMBEDDED_QR_DISABLED"' in router
+            and b"status_code=410" in router
+        ),
+        "status_delegates_public_state": (
+            b"return manager.status()" in status_body and b'"cookie"' not in status_body
+        ),
         "local_session_or_cli_auth": (
             b'request.cookies.get("xhs_session")' in app
             and b'request.headers.get("x-xhs-local-token")' in app
@@ -197,7 +231,7 @@ def _qr_api_check(root: Path) -> dict[str, Any]:
             b"host not in SAFE_HOSTS" in app and b"_origin_is_local(origin, request_port)" in app
         ),
     }
-    return {"name": "embedded_qr_local_api_contract", "passed": all(markers.values()), "detail": markers}
+    return {"name": "isolated_browser_local_api_contract", "passed": all(markers.values()), "detail": markers}
 
 
 def _container_policy_check(root: Path) -> dict[str, Any]:
@@ -234,8 +268,8 @@ def _static_checks(root: Path) -> list[dict[str, Any]]:
             "detail": [f"{item.path}: {item.reason}" for item in source_findings],
         },
         _python_only_check(root),
-        _direct_qr_check(root),
-        _qr_api_check(root),
+        _browser_login_check(root),
+        _browser_api_check(root),
         _container_policy_check(root),
     ]
 
@@ -328,19 +362,18 @@ def build_evidence(root: Path, *, container_image: str | None = None) -> dict[st
             "runtime": "python-only",
         },
         "limits": {
-            "direct_qr_json_response_bytes": 256 * 1024,
+            "browser_login_control": "fixed-argv-loopback-random-cdp",
             "collection_json_response_bytes": 4 * 1024 * 1024,
-            "direct_qr_poll_seconds": 2,
-            "direct_qr_timeout_seconds": 180,
-            "direct_qr_transport": "authenticated-same-origin-image-png-no-store",
+            "browser_login_cookie_scope": "https://edith.xiaohongshu.com/api/sns/web/v2/user/me",
+            "browser_login_profile": "temporary-isolated-delete-on-terminal-state",
         },
         "checks": checks,
         "result": "passed" if all(item["passed"] for item in checks) else "failed",
         "human_approval_still_required": [
             "independent source-provenance and data-flow review",
-            "real low-frequency direct QR scan -> formal session -> /user/me nonguest -> collection smoke",
+            "real low-frequency isolated browser login -> /user/me nonguest -> collection smoke",
             "manual confirmation that remote program text is never executed, saved, or logged",
-            "manual confirmation that QR bytes are removed on every terminal path",
+            "manual confirmation that browser/CDP/profile resources are removed on every terminal path",
             "release-owner review of this evidence and private G1 approval record",
         ],
     }

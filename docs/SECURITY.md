@@ -18,13 +18,15 @@ CrimsonFlux 是本地单用户源码预览，不是互联网服务。Web 服务�
 
 平台响应中的任何 program/script 字段都按不可信 opaque data 处理并立即丢弃，不得写入文件、数据库、错误文本或传给执行器。
 
-## 页面内二维码
+## 隔离可见浏览器登录
 
-扫码登录使用固定纯 HTTP 接口。应用不会启动 Chrome 或其他浏览器，不使用 CDP、DevTools、WebSocket 调试端口或浏览器 Profile。
+为避免要求普通用户打开开发者工具，原生桌面环境可以启动一次性、可见的官方网页登录窗口。它不是用户日常浏览器：应用从固定 Chrome/Edge/Chromium 路径 allowlist 选择程序，以固定参数创建权限 `0700` 的随机临时 Profile，只打开固定官方 URL；不接受自定义 executable、flags 或 URL，也不读取默认 Profile。
 
-二维码 URL 只接受固定的小红书 HTTPS host，不得含端口或凭据；PNG 在本地内存生成。轮询成功后必须以正式 session 替换 visitor session，并在 `/user/me` 返回 `success=true`、`guest=false` 后才加密保存。成功、取消、失败、超时和退出均清空 QR value、ID、code 与 PNG。
+调试接口只绑定 `127.0.0.1` 随机端口。允许的 CDP 方法限于 `Target.getTargets`、`Target.attachToTarget`、`Network.enable` 和 URL-scoped `Network.getCookies`。禁止执行页面 JavaScript、读取响应正文、DOM、截图、localStorage、浏览历史或浏览器全局 Cookie。禁止 `--no-sandbox`、`--disable-web-security` 和通配 remote origins。
 
-兼容路径 `GET /api/v1/auth/browser/qr` 只返回 `image/png`，要求 Host/Origin 和本地 Web 会话或 CLI token，并强制 `private, no-store`、旧式缓存禁用与 `nosniff`。它不返回 Cookie、QR value、签名输入、平台秘密响应或诊断原文；路径名称不表示浏览器自动化。
+应用只查询固定 `/user/me` URL 可用的 Cookie，过滤为平台域，要求 `a1` 与 `web_session`，再交给既有 adapter 请求 `/user/me` 验证 `guest=false` 与非空用户 ID。验证成功前不保存凭证；成功、取消、失败、超时、窗口关闭和服务关闭都必须关闭 CDP/浏览器、清空内存引用并删除临时 Profile。
+
+Docker、无 GUI 环境或未找到 allowlist 浏览器时自动登录明确不可用，用户仍可主动使用手动 Cookie 导入。不得回退到默认 Profile、任意 executable、shell、危险 flags 或更宽的调试能力。完整边界见 [G1_SECURITY.md](G1_SECURITY.md)。
 
 在独立威胁建模、负向测试、真实低频 smoke 与发布负责人批准完成前，G1 视为未通过：
 
@@ -39,7 +41,7 @@ G1 验收与回退见 [RELEASE_GATES.md](RELEASE_GATES.md)。
 - Cookie、`xsec_token` 和签名材料不得进入 URL 日志、命令行参数、环境变量、CSV 或 JSONL。Web 使用密码样式字段，CLI 只允许隐藏输入或标准输入。
 - SQLite 中的登录态使用 AES-256-GCM 加密；主密钥与数据库分文件保存。该措施主要防止数据库或导出文件被单独复制后的明文泄露，不抵御已取得本机用户完整权限的攻击者。
 - 主密钥不能是 symlink；POSIX 使用 `0600`，Windows 限制为当前用户 ACL。权限无法收紧时应用应拒绝继续读取凭证。
-- 二维码 PNG、QR value、qr_id/code、Cookie 和平台秘密响应不得进入状态 JSON、日志或错误文本。
+- Cookie、CDP endpoint、target 元数据、临时 Profile 路径和平台秘密响应不得进入状态 JSON、日志或错误文本。
 - GitHub hosted runner 不执行真实登录 smoke，也不保存 Cookie。
 - Docker 使用 `docker compose down --volumes` 清除状态卷；原生模式按 [PRIVACY.md](PRIVACY.md) 删除状态目录。
 
@@ -73,7 +75,7 @@ Source ZIP 与 Docker context 只包含 CrimsonFlux Python 应用、静态资源
 - 第三方采集器源码、subtree、压缩包和缓存；
 - symlink、路径穿越、状态库、密钥、日志、虚拟环境和真实导出；
 - PEM 私钥、高置信 Cookie/Token 与未脱敏签名参数；
-- 动态代码执行、浏览器 subprocess/CDP 和网络下载代码表面；
+- 动态代码执行、规范登录模块外的浏览器 subprocess/CDP，以及规范模块内的危险 CDP/flags；
 - 依赖锁之外的运行时包。
 
 这些自动检查是 G0/G1 人工审批的补充，不能替代许可证复核或独立威胁评审。由于开发历史中曾研究其他实现，CrimsonFlux 不宣称严格 clean-room；只声明当前发行物不复制、不分发且不依赖 Spider_XHS。

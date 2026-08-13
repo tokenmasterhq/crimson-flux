@@ -18,14 +18,12 @@
   ]);
   const BROWSER_LOGIN_ACTIVE = new Set([
     "starting",
-    "awaiting_scan",
-    "awaiting_phone_confirmation",
+    "awaiting_login",
     "verifying",
   ]);
   const BROWSER_LOGIN_LABELS = {
-    starting: "正在生成",
-    awaiting_scan: "等待扫码",
-    awaiting_phone_confirmation: "等待手机确认",
+    starting: "正在打开",
+    awaiting_login: "等待网页登录",
     verifying: "正在验证",
     succeeded: "登录成功",
     failed: "登录未完成",
@@ -34,22 +32,34 @@
     cancelled: "已取消",
     idle: "尚未开始",
   };
-  const PLATFORM_CHALLENGE_REQUIRED = "PLATFORM_CHALLENGE_REQUIRED";
-  const PLATFORM_CHALLENGE_MESSAGE =
-    "手机确认已完成，但平台要求额外网页验证；当前安全模式无法在页内自动完成。";
+  const PRESET_LABELS = {
+    basic: "快速版",
+    full: "完整版",
+    custom: "自己选择",
+  };
+  const TERMINATION_LABELS = {
+    natural_end: "已经看到最后一页",
+    reached_limit: "已经达到你设置的数量",
+    source_exhausted: "没有更多结果",
+    safety_cap: "达到本机设置的安全上限",
+    pagination_stalled: "平台没有返回新的下一页",
+    process_interrupted: "服务曾被中断",
+    user_cancelled: "由你手动停止",
+    no_records: "没有找到可保存的内容",
+  };
 
   const STATUS_LABELS = {
     queued: "等待运行",
-    enumerating: "正在列出笔记",
-    awaiting_detail_confirmation: "等待详情确认",
-    fetching_details: "正在补全详情",
-    exporting: "正在生成文件",
+    enumerating: "正在查找内容",
+    awaiting_detail_confirmation: "等你确认",
+    fetching_details: "正在获取更多信息",
+    exporting: "正在打包结果",
     completed: "已完成",
-    completed_with_warnings: "已完成，有缺失",
-    paused_auth: "登录失效，已暂停",
-    paused_rate_limit: "触发限流，已暂停",
+    completed_with_warnings: "已完成，部分信息缺失",
+    paused_auth: "需要重新登录",
+    paused_rate_limit: "访问过快，已暂停",
     paused_interrupted: "服务中断，已暂停",
-    paused_cursor_invalid: "翻页位置失效，请新建任务",
+    paused_cursor_invalid: "无法继续翻页，请重新创建",
     cancelled: "已取消",
     failed: "失败",
   };
@@ -69,12 +79,6 @@
     jobsTimer: null,
     browserLoginTimer: null,
     browserLoginDeadlineMs: null,
-    browserQrGeneration: 0,
-    browserQrLoading: false,
-    browserQrLoaded: false,
-    browserQrError: false,
-    browserQrObjectUrl: null,
-    browserQrRevision: null,
     manualLoginAutoOpened: false,
     confirmJob: null,
     toastTimer: null,
@@ -97,7 +101,6 @@
     browserLogin: document.querySelector("#browser-login"),
     browserLoginCapability: document.querySelector("#browser-login-capability"),
     browserLoginVisual: document.querySelector("#browser-login-visual"),
-    browserLoginQr: document.querySelector("#browser-login-qr"),
     browserLoginPlaceholder: document.querySelector("#browser-login-placeholder"),
     browserLoginPlaceholderText: document.querySelector("#browser-login-placeholder-text"),
     browserLoginProgress: document.querySelector("#browser-login-progress"),
@@ -251,10 +254,10 @@
 
   function humanError(error) {
     if (error instanceof ApiError && error.code === "UPSTREAM_UNSUPPORTED") {
-      return "当前内容处理组件不可用，请检查健康状态中的阻断项。";
+      return "整理功能暂时不可用，请重启服务或查看排错指南。";
     }
     if (error instanceof ApiError && error.code === "AUTH_EXPIRED") {
-      return "登录已过期。请重新扫码登录（或手动导入 Cookie）后恢复任务。";
+      return "登录已过期。请重新打开官方网页登录（或手动导入登录状态）后恢复任务。";
     }
     if (error instanceof ApiError && error.code === "RATE_LIMITED") {
       return "平台暂时限制了请求。任务已安全暂停，请稍后恢复。";
@@ -264,7 +267,7 @@
 
   function setServerAvailable(available) {
     if (available && state.health?.status === "degraded") {
-      setPill(elements.serverStatus, "处理组件未就绪", "warning");
+      setPill(elements.serverStatus, "整理功能未就绪", "warning");
       return;
     }
     setPill(
@@ -285,7 +288,7 @@
       elements.keywordLimit.value = String(state.limits.keyword);
     }
     elements.keywordLimitHelp.textContent =
-      `服务配置上限为 ${state.limits.keyword} 条；实际结果可能因去重、无更多结果或风控而更少。`;
+      `本次最多可设置 ${state.limits.keyword} 条；如果没有足够结果，最终数量可能会更少。`;
     updateEstimate();
     if (state.auth) renderAuth(state.auth);
   }
@@ -357,9 +360,6 @@
     const browserSupported = collector.browser_login_supported === true;
     const collectionReady = collector.collection_runtime_ok === true;
     const browserActive = BROWSER_LOGIN_ACTIVE.has(state.browserLogin?.status);
-    const challengeRequired = isPlatformChallengeRequired(state.browserLogin);
-    const qrRetryAllowed =
-      state.browserLogin?.status === "awaiting_scan" && state.browserQrError;
     elements.authAction.disabled =
       !connected && (!(browserSupported || importSupported) || browserActive);
     elements.logout.hidden = false;
@@ -367,17 +367,15 @@
     elements.authLoggedIn.hidden = !connected;
     setButtonLabel(
       elements.authAction,
-      connected ? "账号已连接" : browserSupported ? "扫码登录" : "导入登录态",
+      connected ? "账号已连接" : browserSupported ? "网页登录" : "导入登录态",
     );
     elements.cookieInput.disabled = !importSupported || browserActive;
     elements.importLogin.disabled = !importSupported || browserActive;
-    elements.browserLogin.disabled =
-      !browserSupported || (browserActive && !qrRetryAllowed);
-    elements.browserLoginCapability.textContent = challengeRequired
-      ? "重新扫码可能仍会遇到相同验证，建议使用下方 Cookie 导入。"
-      : browserSupported
-        ? `二维码有效期约 ${collector.browser_login_timeout_seconds || 180} 秒 · 扫码后请按手机提示完成确认或验证`
-        : collector.browser_login_reason || "当前环境不支持扫码；可以展开下方手动导入。";
+    elements.browserLogin.disabled = !browserSupported || browserActive;
+    elements.browserLoginCapability.textContent = browserSupported
+      ? `${collector.browser_name || "Chrome / Edge"} 临时窗口 · 最多等待 ${Math.ceil((collector.browser_login_timeout_seconds || 300) / 60)} 分钟 · 完成后自动关闭`
+      : collector.browser_login_reason ||
+        "当前环境无法打开官方网页登录窗口；可以展开下方手动导入。";
     if (!browserSupported && importSupported && !state.manualLoginAutoOpened) {
       elements.manualLogin.open = true;
       state.manualLoginAutoOpened = true;
@@ -388,7 +386,7 @@
       connected
         ? collectionReady
           ? "开始整理"
-          : "处理组件未就绪"
+          : "整理功能未就绪"
         : "请先完成登录",
     );
     if (connected) {
@@ -421,11 +419,7 @@
   }
 
   function browserLoginVariant(status) {
-    if (
-      ["starting", "awaiting_scan", "awaiting_phone_confirmation", "verifying"].includes(
-        status,
-      )
-    ) {
+    if (["starting", "awaiting_login", "verifying"].includes(status)) {
       return "running";
     }
     if (status === "succeeded") return "success";
@@ -434,51 +428,34 @@
     return "neutral";
   }
 
-  function isPlatformChallengeRequired(payload) {
-    return (
-      payload?.status === "failed" &&
-      payload?.error_code === PLATFORM_CHALLENGE_REQUIRED
-    );
-  }
-
   function browserLoginDisplayMessage(payload, fallback) {
-    if (isPlatformChallengeRequired(payload)) return PLATFORM_CHALLENGE_MESSAGE;
     return payload?.message || fallback;
   }
 
   function renderManualLoginFallback(payload) {
-    const recommended = isPlatformChallengeRequired(payload);
+    const recommended =
+      payload?.status === "failed" &&
+      ["BROWSER_NOT_FOUND", "BROWSER_LAUNCH_FAILED", "BROWSER_CONTROL_FAILED"].includes(
+        payload?.error_code,
+      );
     elements.manualLogin.classList.toggle("is-recommended", recommended);
     elements.manualLoginRecommendation.hidden = !recommended;
     elements.manualLoginTitle.textContent = recommended
-      ? "建议改用 Cookie 导入"
-      : "扫码不可用？手动导入 Cookie";
+      ? "建议改用手动导入"
+      : "窗口打不开？手动导入登录状态";
     elements.manualLoginSubtitle.textContent = recommended
-      ? "先在官方网页完成额外验证，再把网页登录态安全保存到本机"
-      : "Docker 与无图形界面环境使用此方式";
+      ? "先在普通浏览器完成官方登录，再把登录状态安全保存到本机"
+      : "Docker 或没有图形界面时使用";
     if (recommended) {
       elements.manualLogin.open = true;
       state.manualLoginAutoOpened = true;
     }
   }
 
-  function releaseBrowserQrObjectUrl() {
-    if (state.browserQrObjectUrl) {
-      URL.revokeObjectURL(state.browserQrObjectUrl);
-      state.browserQrObjectUrl = null;
-    }
-    elements.browserLoginQr.removeAttribute("src");
-  }
-
-  function resetBrowserQr({ message = "点击获取登录二维码", visualState = "idle" } = {}) {
-    state.browserQrGeneration += 1;
-    state.browserQrLoading = false;
-    state.browserQrLoaded = false;
-    state.browserQrError = false;
-    state.browserQrRevision = null;
-    releaseBrowserQrObjectUrl();
-    elements.browserLoginQr.hidden = true;
-    elements.browserLoginPlaceholder.hidden = false;
+  function resetBrowserLoginVisual({
+    message = "点击后会打开临时官方窗口",
+    visualState = "idle",
+  } = {}) {
     elements.browserLoginPlaceholderText.textContent = message;
     elements.browserLoginVisual.dataset.state = visualState;
   }
@@ -510,7 +487,7 @@
     if (state.browserLoginDeadlineMs === null) {
       const timeout = configuredNumber(
         state.health?.collector?.browser_login_timeout_seconds,
-        180,
+        300,
         1,
       );
       state.browserLoginDeadlineMs = Date.now() + timeout * 1000;
@@ -525,129 +502,28 @@
     elements.browserLoginCountdown.hidden = false;
   }
 
-  async function loadBrowserQrImage({ quiet = false } = {}) {
-    if (state.browserQrLoading || state.browserQrLoaded) return;
-    const generation = state.browserQrGeneration;
-    let candidateObjectUrl = null;
-    state.browserQrLoading = true;
-    state.browserQrError = false;
-    elements.browserLoginVisual.dataset.state = "loading";
-    elements.browserLoginPlaceholder.hidden = false;
-    elements.browserLoginPlaceholderText.textContent = "正在加载二维码…";
-    setButtonLabel(elements.browserLogin, "正在加载二维码…");
-    renderAuth(state.auth);
-    try {
-      const response = await fetch(`${API_BASE}/auth/browser/qr`, {
-        method: "GET",
-        headers: { Accept: "image/png" },
-        credentials: "same-origin",
-        cache: "no-store",
-      });
-      const contentType = response.headers.get("content-type") || "";
-      const responseRevision = response.headers.get("x-xhs-qr-revision");
-      if (!response.ok || !contentType.toLowerCase().startsWith("image/png")) {
-        throw new ApiError("二维码暂时无法加载，请重试。", {
-          code: "QR_IMAGE_UNAVAILABLE",
-          status: response.status,
-        });
-      }
-      const blob = await response.blob();
-      if (blob.size === 0 || blob.size > 1024 * 1024) {
-        throw new ApiError("二维码图片格式异常，请重新获取。", {
-          code: "QR_IMAGE_INVALID",
-        });
-      }
-      candidateObjectUrl = URL.createObjectURL(blob);
-      await new Promise((resolve, reject) => {
-        elements.browserLoginQr.onload = resolve;
-        elements.browserLoginQr.onerror = () => reject(new Error("invalid QR image"));
-        elements.browserLoginQr.src = candidateObjectUrl;
-      });
-      if (generation !== state.browserQrGeneration) {
-        URL.revokeObjectURL(candidateObjectUrl);
-        candidateObjectUrl = null;
-        return;
-      }
-      if (state.browserQrObjectUrl) URL.revokeObjectURL(state.browserQrObjectUrl);
-      state.browserQrObjectUrl = candidateObjectUrl;
-      candidateObjectUrl = null;
-      state.browserQrLoaded = true;
-      state.browserQrRevision =
-        responseRevision || state.browserLogin?.qr_revision || null;
-      elements.browserLoginQr.hidden = false;
-      elements.browserLoginPlaceholder.hidden = true;
-      elements.browserLoginVisual.dataset.state = "ready";
-      setButtonLabel(elements.browserLogin, "等待扫码确认");
-      elements.srStatus.textContent = "登录二维码已显示，请使用平台官方 App 扫描。";
-    } catch (error) {
-      if (candidateObjectUrl) URL.revokeObjectURL(candidateObjectUrl);
-      if (generation !== state.browserQrGeneration) return;
-      state.browserQrError = true;
-      elements.browserLoginQr.hidden = true;
-      elements.browserLoginPlaceholder.hidden = false;
-      elements.browserLoginPlaceholderText.textContent = "二维码加载失败";
-      elements.browserLoginVisual.dataset.state = "error";
-      setButtonLabel(elements.browserLogin, "重新加载二维码");
-      if (!quiet) showToast(humanError(error), true);
-    } finally {
-      if (generation === state.browserQrGeneration) {
-        state.browserQrLoading = false;
-        renderAuth(state.auth);
-      }
-    }
-  }
-
   function renderBrowserLogin(payload) {
     const previousStatus = state.browserLogin?.status || "idle";
-    const nextQrRevision = payload?.qr_revision || null;
     state.browserLogin = payload || { status: "idle" };
     const status = state.browserLogin.status || "idle";
     const active = BROWSER_LOGIN_ACTIVE.has(status);
     const visible = status !== "idle";
-    const challengeRequired = isPlatformChallengeRequired(state.browserLogin);
-    const terminalMessage = {
-      awaiting_phone_confirmation:
-        "已扫码，请按手机提示完成确认；如要求短信验证，请在手机端完成。",
-      failed: "登录未完成，请重新获取二维码",
-      browser_closed: "登录会话已关闭，请重新获取二维码",
-      expired: "二维码已过期，请重新获取",
-      cancelled: "扫码登录已取消",
-      succeeded: "登录成功",
-      idle: "点击获取登录二维码",
+    const visual = {
+      starting: ["正在打开临时官方窗口…", "loading"],
+      awaiting_login: ["请在弹出的官方窗口完成登录", "ready"],
+      verifying: ["检测到登录，正在验证账号…", "verifying"],
+      succeeded: ["账号已连接，临时窗口已关闭", "succeeded"],
+      failed: ["网页登录未完成，可以重试或使用手动方式", "error"],
+      browser_closed: ["临时窗口已关闭，登录未完成", "error"],
+      expired: ["等待超时，请重新打开网页登录", "expired"],
+      cancelled: ["已取消网页登录", "idle"],
+      idle: ["点击后会打开临时官方窗口", "idle"],
     };
-    if (
-      [
-        "awaiting_phone_confirmation",
-        "verifying",
-        "succeeded",
-        "failed",
-        "expired",
-        "cancelled",
-        "browser_closed",
-        "idle",
-      ].includes(status) &&
-      status !== previousStatus
-    ) {
-      resetBrowserQr({
-        message: challengeRequired
-          ? "需要额外网页验证"
-          : terminalMessage[status] || "正在验证登录…",
-        visualState: challengeRequired ? "challenge" : status,
-      });
-    } else if (status === "starting" && previousStatus !== "starting") {
-      resetBrowserQr({ message: "正在生成登录二维码…", visualState: "loading" });
-    } else if (
-      status === "awaiting_scan" &&
-      state.browserQrLoaded &&
-      nextQrRevision &&
-      state.browserQrRevision !== nextQrRevision
-    ) {
-      resetBrowserQr({ message: "二维码已刷新，正在加载新二维码…", visualState: "loading" });
+    if (status !== previousStatus) {
+      const [message, visualState] = visual[status] || ["正在处理网页登录…", "loading"];
+      resetBrowserLoginVisual({ message, visualState });
     }
-    const terminalWithoutProgress =
-      ["cancelled", "expired", "browser_closed", "failed"].includes(status) &&
-      !challengeRequired;
-    elements.browserLoginProgress.hidden = !visible || terminalWithoutProgress;
+    elements.browserLoginProgress.hidden = !visible || (!active && status !== "succeeded");
     elements.cancelBrowserLogin.hidden = !active;
     setPill(
       elements.browserLoginStatus,
@@ -656,9 +532,7 @@
     );
     elements.browserLoginMessage.textContent = browserLoginDisplayMessage(
       state.browserLogin,
-      status === "awaiting_scan"
-        ? "请使用平台官方 App 扫描二维码，并在手机上确认。"
-        : terminalMessage[status] || "正在准备登录二维码…",
+      visual[status]?.[0] || "正在处理网页登录…",
     );
     updateBrowserLoginCountdown(status, state.browserLogin);
     if (status !== previousStatus) {
@@ -666,32 +540,16 @@
     }
     setButtonLabel(
       elements.browserLogin,
-      status === "awaiting_scan" && state.browserQrError
-        ? "重新加载二维码"
-        : status === "starting"
-          ? "正在生成二维码…"
-          : status === "awaiting_scan"
-            ? state.browserQrLoaded
-              ? "等待扫码确认"
-              : "正在加载二维码…"
-            : status === "awaiting_phone_confirmation"
-              ? "等待手机确认"
-              : status === "verifying"
-                ? "正在验证…"
-                : challengeRequired
-                  ? "仍要尝试扫码"
-                  : ["failed", "expired", "cancelled", "browser_closed"].includes(status)
-                    ? "重新获取二维码"
-                    : "获取登录二维码",
+      status === "starting"
+        ? "正在打开官方窗口…"
+        : status === "awaiting_login"
+          ? "请在官方窗口完成登录"
+          : status === "verifying"
+            ? "正在验证账号…"
+            : ["failed", "expired", "cancelled", "browser_closed"].includes(status)
+              ? "重新打开网页登录"
+              : "打开官方网页登录",
     );
-    if (
-      status === "awaiting_scan" &&
-      !state.browserQrLoaded &&
-      !state.browserQrLoading &&
-      !state.browserQrError
-    ) {
-      void loadBrowserQrImage({ quiet: true });
-    }
     renderManualLoginFallback(state.browserLogin);
     renderAuth(state.auth);
   }
@@ -713,10 +571,10 @@
       const current = result?.status || "idle";
       if (current === "succeeded" && previous !== "succeeded") {
         await loadAuth({ quiet: true });
-        showToast("扫码登录成功，登录态已加密保存在本机。", false);
+        showToast("网页登录成功，登录态已加密保存在本机。", false);
       } else if (["failed", "expired"].includes(current) && current !== previous) {
         showToast(
-          browserLoginDisplayMessage(result, "扫码登录未完成，请检查页面提示。"),
+          browserLoginDisplayMessage(result, "网页登录未完成，请检查页面提示。"),
           true,
         );
       }
@@ -730,21 +588,23 @@
   }
 
   async function startBrowserLogin() {
-    if (state.browserLogin?.status === "awaiting_scan" && state.browserQrError) {
-      await loadBrowserQrImage();
-      return;
-    }
     state.browserLoginDeadlineMs = null;
-    resetBrowserQr({ message: "正在生成登录二维码…", visualState: "loading" });
+    resetBrowserLoginVisual({
+      message: "正在打开临时官方窗口…",
+      visualState: "loading",
+    });
     elements.browserLogin.disabled = true;
-    setButtonLabel(elements.browserLogin, "正在生成二维码…");
+    setButtonLabel(elements.browserLogin, "正在打开官方窗口…");
     try {
       const result = await api("/auth/browser", { method: "POST", body: {} });
       renderBrowserLogin(result);
     } catch (error) {
-      state.browserQrError = true;
       showToast(humanError(error), true);
-      renderBrowserLogin({ status: "failed", message: "二维码获取失败，请重试。" });
+      renderBrowserLogin({
+        status: "failed",
+        error_code: error?.code || "BROWSER_LAUNCH_FAILED",
+        message: "官方网页登录窗口未能打开，请重试或使用手动方式。",
+      });
     } finally {
       scheduleBrowserLoginPoll();
     }
@@ -800,7 +660,7 @@
     elements.logout.disabled = true;
     try {
       await api("/auth/session", { method: "DELETE" });
-      renderBrowserLogin({ status: "idle", message: "尚未启动扫码登录。" });
+      renderBrowserLogin({ status: "idle", message: "尚未启动网页登录。" });
       renderAuth({ authenticated: false });
       showToast("本地登录态已清除。", false);
     } catch (error) {
@@ -820,7 +680,7 @@
       await api("/data", { method: "DELETE" });
       state.jobs = [];
       renderJobs();
-      renderBrowserLogin({ status: "idle", message: "尚未启动扫码登录。" });
+      renderBrowserLogin({ status: "idle", message: "尚未启动网页登录。" });
       await loadAuth({ quiet: true });
       showToast("全部本地数据已清除，本地主密钥已轮换。", false);
     } catch (error) {
@@ -885,21 +745,22 @@
     const small = elements.estimate.querySelector("small");
     if (state.sourceType === "user") {
       strong.textContent = withDetails
-        ? "耗时取决于公开内容数量；列出后会再次确认详情补全"
-        : "耗时取决于该用户当前可见的公开笔记数量";
+        ? "先找齐可见内容，再询问你是否继续读取正文等更多信息"
+        : "会自动翻页，直到没有新的可见内容";
       small.textContent = withDetails
-        ? `届时会显示数量和新估算；确认前不请求详情。当前请求间隔 ${state.limits.pauseMinSeconds}–${state.limits.pauseMaxSeconds} 秒。`
-        : `会持续翻页到无更多结果；当前请求间隔 ${state.limits.pauseMinSeconds}–${state.limits.pauseMaxSeconds} 秒。`;
+        ? `找到内容后会显示数量和新的时间估算；你确认前不会逐条打开。每次操作会间隔 ${state.limits.pauseMinSeconds}–${state.limits.pauseMaxSeconds} 秒。`
+        : `内容越多，等待越久。程序每次操作会间隔 ${state.limits.pauseMinSeconds}–${state.limits.pauseMaxSeconds} 秒。`;
       return;
     }
     const count = Math.max(1, Number(elements.keywordLimit.value) || 1);
     const requests = requestEstimate(count, withDetails);
     strong.textContent =
-      `预计列表请求约 ${requests.listRequests} 次，最多详情请求 ${requests.detailRequests} 次；` +
-      `按当前间隔耗时约 ${estimateRange(count, withDetails)}`;
+      `大约需要查看 ${requests.listRequests} 页结果` +
+      (withDetails ? `，再逐条读取最多 ${requests.detailRequests} 项内容` : "") +
+      `；预计等待 ${estimateRange(count, withDetails)}`;
     small.textContent = withDetails
-      ? "完整/自定义详情需要逐条请求，数量越大耗时越长，失败项会在导出文件中标注。"
-      : "基础字段主要来自列表页；网络、风控和平台响应仍会造成波动。";
+      ? "选择完整版或更多信息后，程序会逐条打开内容；没能读到的信息会在文件中注明。"
+      : "快速版不逐条打开内容；网络速度和平台响应仍会影响等待时间。";
   }
 
   function setSourceType(type) {
@@ -926,7 +787,7 @@
     const preset = selectedPreset();
     const fields = selectedFields();
     if (preset === "custom" && fields.length === 0) {
-      throw new Error("自定义模式至少选择一个字段组。", { cause: "validation" });
+      throw new Error("请至少勾选一类要保存的信息。", { cause: "validation" });
     }
     const content = { preset, fields };
     let source;
@@ -950,7 +811,7 @@
         throw new Error("用户主页地址格式不正确。", { cause: "validation" });
       }
       if (!elements.userAllAck.checked) {
-        throw new Error("请先确认你理解“全部公开笔记”的范围。", { cause: "validation" });
+        throw new Error("请先勾选主页内容范围说明。", { cause: "validation" });
       }
       source = { type: "user", profile_url: publicProfileUrl, all: true };
     }
@@ -1011,7 +872,7 @@
 
   function jobTitle(job) {
     if (job.source_type === "keyword" || job.source?.type === "keyword") {
-      return `关键词：${job.source?.keyword || "未知"}`;
+      return `主题：${job.source?.keyword || "未知"}`;
     }
     const url = job.source?.profile_url || "";
     let profilePath = url;
@@ -1021,7 +882,7 @@
       profilePath = url.split(/[?#]/, 1)[0];
     }
     const profileId = profilePath.split("/").filter(Boolean).pop();
-    return `用户：${profileId || "公开主页"}`;
+    return `主页：${profileId || "未命名"}`;
   }
 
   function statusVariant(status) {
@@ -1059,21 +920,25 @@
     const detailFailed = Number(job.detail_failed || 0);
     if (job.status === "enumerating") {
       const target = job.source?.type === "keyword" ? Number(job.source.limit || 0) : null;
-      return target ? `已列出 ${unique} / 目标 ${target} 条` : `已列出 ${unique} 条，正在查找下一页`;
+      return target ? `已找到 ${unique} / 目标 ${target} 条` : `已找到 ${unique} 条，正在查看下一页`;
     }
     if (job.status === "fetching_details") {
-      return `详情成功 ${detailSucceeded}，失败 ${detailFailed}，共发现 ${unique} 条`;
+      return `更多信息已获取 ${detailSucceeded} 条，未取到 ${detailFailed} 条；共找到 ${unique} 条`;
     }
     if (job.status === "awaiting_detail_confirmation") {
-      return `已列出 ${unique} 条；确认前不会逐条请求详情`;
+      return `已找到 ${unique} 条；等你决定是否继续读取更多信息`;
     }
     if (TERMINAL_STATUSES.has(job.status) || job.status?.startsWith("paused_")) {
-      const parts = [`共 ${unique} 条`];
-      if (detailSucceeded || detailFailed) parts.push(`详情成功 ${detailSucceeded} / 失败 ${detailFailed}`);
-      if (job.termination_reason) parts.push(`结束原因：${job.termination_reason}`);
+      const parts = [`共整理 ${unique} 条`];
+      if (detailSucceeded || detailFailed) {
+        parts.push(`更多信息：完整 ${detailSucceeded} / 未取到 ${detailFailed}`);
+      }
+      if (job.termination_reason) {
+        parts.push(`结束原因：${TERMINATION_LABELS[job.termination_reason] || "运行已安全结束"}`);
+      }
       return parts.join(" · ");
     }
-    return "任务会按创建顺序运行";
+    return "会按创建顺序自动开始";
   }
 
   function element(tag, className, text) {
@@ -1110,8 +975,22 @@
     link.dataset.exportDownload = format;
     link.append(
       iconElement("download"),
-      element("span", "", format === "manifest" ? "manifest" : format.toUpperCase()),
+      element(
+        "span",
+        "",
+        format === "manifest"
+          ? "任务说明"
+          : format === "csv"
+            ? "表格 (.csv)"
+            : "原始数据 (.jsonl)",
+      ),
     );
+    link.title =
+      format === "manifest"
+        ? "包含本次整理数量、完成情况和文件校验信息"
+        : format === "csv"
+          ? "适合用 Excel、Numbers 或表格软件打开"
+          : "适合交给其他数据工具继续处理";
     return link;
   }
 
@@ -1170,7 +1049,7 @@
     const topline = element("div", "job-topline");
     const title = element("div", "job-title");
     title.append(element("strong", "", jobTitle(job)));
-    title.append(element("small", "", `任务 ${job.id}`));
+    title.append(element("small", "", `编号 ${String(job.id).slice(0, 8)}`));
     const pill = element("span", `status-pill status-${statusVariant(job.status)}`);
     pill.append(element("span", "status-dot"), element("span", "", STATUS_LABELS[job.status] || job.status));
     topline.append(title, pill);
@@ -1179,8 +1058,8 @@
     const preset = job.content?.preset || "basic";
     meta.append(
       element("span", "", `创建于 ${formatDate(job.created_at)}`),
-      element("span", "", `字段：${preset}`),
-      element("span", "", `已请求 ${Number(job.pages_requested || 0)} 页`),
+      element("span", "", `保存内容：${PRESET_LABELS[preset] || "自定义"}`),
+      element("span", "", `已查看 ${Number(job.pages_requested || 0)} 页`),
     );
     const progress = element("progress", "progress-track");
     progress.setAttribute("role", "progressbar");
@@ -1206,7 +1085,7 @@
 
     const actions = element("div", "job-actions");
     if (job.status === "awaiting_detail_confirmation") {
-      actions.append(actionButton("确认补全详情", "confirm", job.id, "primary"));
+      actions.append(actionButton("选择是否读取更多信息", "confirm", job.id, "primary"));
     }
     if (ACTIVE_STATUSES.has(job.status) || job.status === "awaiting_detail_confirmation") {
       actions.append(actionButton("取消", "cancel", job.id, "secondary"));
@@ -1312,10 +1191,13 @@
   function openDetailConfirmation(job) {
     state.confirmJob = job;
     const count = Number(job.unique_notes || 0);
-    elements.confirmSummary.textContent = `该用户当前已发现 ${count} 条公开笔记。你选择了“${job.content?.preset || "full"}”字段方案。`;
+    const preset = job.content?.preset || "full";
+    elements.confirmSummary.textContent =
+      `这个主页已找到 ${count} 条公开内容。你选择的是“${PRESET_LABELS[preset] || "完整版"}”。`;
     elements.confirmEstimate.textContent =
-      `最多发起 ${count} 次详情请求；按当前 ${state.limits.pauseMinSeconds}–` +
-      `${state.limits.pauseMaxSeconds} 秒间隔，详情阶段预计需 ${detailEstimateRange(count)}`;
+      `接下来最多逐条读取 ${count} 项内容；` +
+      `每次间隔 ${state.limits.pauseMinSeconds}–${state.limits.pauseMaxSeconds} 秒，` +
+      `预计还需 ${detailEstimateRange(count)}`;
     if (typeof elements.detailDialog.showModal === "function") {
       elements.detailDialog.showModal();
     } else if (window.confirm(`${elements.confirmSummary.textContent}\n${elements.confirmEstimate.textContent}`)) {
@@ -1349,14 +1231,14 @@
     event?.preventDefault();
     const job = state.confirmJob;
     if (!job) return;
-    await submitDetailDecision(job.content, "已确认，任务将继续补全详情。");
+    await submitDetailDecision(job.content, "已确认，将继续获取更多信息。");
   }
 
   async function exportBasic(event) {
     event?.preventDefault();
     await submitDetailDecision(
       { preset: "basic", fields: [] },
-      "已改为仅导出基础字段，不会逐条请求详情。",
+      "已改为快速导出，不会逐条打开内容。",
     );
   }
 
@@ -1454,7 +1336,6 @@
     window.addEventListener("beforeunload", () => {
       window.clearTimeout(state.jobsTimer);
       window.clearTimeout(state.browserLoginTimer);
-      releaseBrowserQrObjectUrl();
       elements.cookieInput.value = "";
     });
   }

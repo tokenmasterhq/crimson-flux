@@ -109,8 +109,52 @@ def test_backend_persists_only_the_adapter_verified_credential() -> None:
         jobs=object(),  # type: ignore[arg-type]
     )
 
-    assert backend.import_cookie("unverified-input") == {"authenticated": True}
-    assert events == ["verified", "closed", "persisted"]
+    assert backend.import_cookie(
+        "unverified-input",
+        before_persist=lambda: events.append("profile-cleaned"),
+    ) == {"authenticated": True}
+    assert events == ["verified", "profile-cleaned", "closed", "persisted"]
+
+
+def test_backend_never_persists_when_isolated_profile_cleanup_fails() -> None:
+    verified = VerifiedLogin(
+        cookie="a1=verified-a1; web_session=verified-session",
+        account_id="account-1",
+    )
+
+    class IdleRepository:
+        @staticmethod
+        def has_running_or_queued_jobs() -> bool:
+            return False
+
+    class VerifiedAdapter:
+        @staticmethod
+        def verify_cookie(_cookie: str) -> VerifiedLogin:
+            return verified
+
+    class ForbiddenAuth:
+        @staticmethod
+        def persist_verified_login(**_kwargs: object) -> dict[str, object]:
+            raise AssertionError("credential must not persist before profile cleanup")
+
+    backend = Backend(
+        settings=object(),  # type: ignore[arg-type]
+        repository=IdleRepository(),  # type: ignore[arg-type]
+        cipher=object(),  # type: ignore[arg-type]
+        auth=ForbiddenAuth(),
+        adapter=VerifiedAdapter(),
+        exporter=object(),  # type: ignore[arg-type]
+        jobs=object(),  # type: ignore[arg-type]
+    )
+
+    def fail_cleanup() -> None:
+        raise RuntimeError("cleanup failed")
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        backend.import_cookie(
+            "candidate",
+            before_persist=fail_cleanup,
+        )
 
 
 def test_backend_refuses_credential_change_while_a_job_is_active() -> None:

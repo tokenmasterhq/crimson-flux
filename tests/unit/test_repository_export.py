@@ -224,12 +224,25 @@ def test_csv_jsonl_and_manifest_share_rows(tmp_path: Path) -> None:
     )
     paths = Exporter(repository, tmp_path / "exports", collector_version="fixture-v1").export(job["id"])
     with Path(paths["csv"]).open(encoding="utf-8-sig", newline="") as handle:
-        csv_rows = list(csv.DictReader(handle))
+        csv_reader = csv.DictReader(handle)
+        csv_rows = list(csv_reader)
+        csv_columns = csv_reader.fieldnames or []
     json_rows = [
         json.loads(line)
         for line in Path(paths["jsonl"]).read_text(encoding="utf-8").splitlines()
     ]
     assert [row["note_id"] for row in csv_rows] == [row["note_id"] for row in json_rows]
+    assert csv_columns[:4] == ["title", "note_url", "note_type", "note_id"]
+    for internal_column in (
+        "schema_version",
+        "job_id",
+        "source_type",
+        "source_query",
+        "source_page",
+        "source_rank",
+    ):
+        assert internal_column not in csv_columns
+        assert internal_column in json_rows[0]
     assert csv_rows[0]["title"].startswith("'")
     assert json_rows[0]["title"] == "=SUM(1,1)"
     assert json_rows[0]["liked_count"] == 12000
@@ -241,6 +254,8 @@ def test_csv_jsonl_and_manifest_share_rows(tmp_path: Path) -> None:
     manifest = json.loads(Path(paths["manifest"]).read_text(encoding="utf-8"))
     assert manifest["collector_version"] == "fixture-v1"
     assert manifest["counts"]["exported_rows"] == 2
+    assert manifest["content"]["csv_columns"] == csv_columns
+    assert manifest["content"]["columns"] == list(json_rows[0])
     for output in manifest["outputs"]:
         data = (Path(paths["manifest"]).parent / output["filename"]).read_bytes()
         assert hashlib.sha256(data).hexdigest() == output["sha256"]

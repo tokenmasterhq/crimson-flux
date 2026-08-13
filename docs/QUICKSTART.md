@@ -2,7 +2,7 @@
 
 ## 先确认发布状态
 
-公开版本必须有 [RELEASE_GATES.md](RELEASE_GATES.md) 中 G0 与 G1 的通过记录。G0 核对来源、Git 历史、依赖许可与归档内容；G1 核对固定 Python 签名、页面内扫码和凭证边界。本项目没有可由用户启用的演示/fixture 模式。
+公开版本必须有 [RELEASE_GATES.md](RELEASE_GATES.md) 中 G0 与 G1 的通过记录。G0 核对来源、Git 历史、依赖许可与归档内容；G1 核对固定 Python 签名、隔离的官方网页登录和凭证边界。本项目没有可由用户启用的演示/fixture 模式。
 
 ## 路径 A：Docker Compose
 
@@ -14,7 +14,7 @@
 docker compose up -d --build
 ```
 
-打开 `http://127.0.0.1:8765`。登录页会直接显示二维码；用小红书 App 扫码并在手机上确认即可，不会弹出或控制桌面浏览器。
+打开 `http://127.0.0.1:8765`。容器无法直接打开宿主机的图形浏览器，因此 Docker 模式需要按网页中的 5 步指导手动导入登录状态；不会挂载或控制宿主浏览器资料。
 
 启动后可通过 `/api/v1/health` 查看运行状态。真实 adapter 或登录自检未就绪时健康状态为 `degraded`，登录与采集 fail closed，不生成样例结果。
 
@@ -47,6 +47,8 @@ python scripts/start.py
 ```
 
 脚本只检查现有环境、创建仓库内 `.venv`、按 `requirements.lock` 安装带哈希依赖、初始化数据库并启动服务。它不安装系统软件，不请求管理员权限，也不修改 shell、代理或防火墙。
+
+原生模式会从固定安装位置寻找 Chrome、Edge 或 Chromium。点击“打开官方网页登录”后，程序会使用一次性临时资料目录打开官方网页；你可在官方窗口完成扫码、确认或短信验证。验证成功后窗口自动关闭，临时资料被删除，日常浏览器 Profile 不会被读取。
 
 只准备环境：
 
@@ -91,7 +93,7 @@ Windows PowerShell：
 .\.venv\Scripts\crimsonflux.exe export JOB_ID --format all --output-dir .\exports\JOB_ID --yes
 ```
 
-CLI 的 `login` 会创建登录会话并提示打开本地 Web 页面；二维码只由受保护的页面内接口显示，不把原始值写入终端或文件。不要把 Cookie 放在命令行参数、环境变量、`.env` 或 GitHub Actions secret 中。
+CLI 的 `login` 会打开隔离的官方网页登录窗口，完成后自动验证并关闭；Docker 或无图形界面环境可使用 `login --stdin`。不要把 Cookie 放在命令行参数、环境变量、`.env` 或 GitHub Actions secret 中。
 
 若用户主页 URL 含 `xsec_token` 等访问参数，不要放进 `--url` 或 shell 历史；省略 URL 参数后按 CLI 隐藏输入提示粘贴。普通且不含敏感查询参数的完整主页 URL 可直接使用 `--url`。
 

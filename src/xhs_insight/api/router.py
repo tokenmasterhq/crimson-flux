@@ -200,7 +200,7 @@ def create_router(backend: Any) -> APIRouter:
             return {
                 "browser_login_supported": False,
                 "status": "idle",
-                "message": "当前环境不支持官方浏览器扫码登录。",
+                "message": "当前环境不支持自动打开官方网页登录窗口。",
             }
         return manager.status()
 
@@ -213,6 +213,16 @@ def create_router(backend: Any) -> APIRouter:
                 detail={
                     "code": "BROWSER_LOGIN_UNAVAILABLE",
                     "message": "当前环境不支持页面内扫码登录。",
+                    "retryable": False,
+                },
+            )
+        capability = manager.capability() if hasattr(manager, "capability") else {}
+        if capability.get("browser_login_embedded_qr") is not True:
+            raise HTTPException(
+                status_code=410,
+                detail={
+                    "code": "EMBEDDED_QR_DISABLED",
+                    "message": "页面内二维码已停用；请使用隔离的官方网页登录窗口。",
                     "retryable": False,
                 },
             )

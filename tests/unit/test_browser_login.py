@@ -1,93 +1,81 @@
 from __future__ import annotations
 
 import ast
+import base64
+import hashlib
+import inspect
+import json
+import socket
+import struct
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from xhs_insight.adapters import AdapterError
 from xhs_insight.browser_login import (
+    COOKIE_SOURCE_URL,
+    OFFICIAL_LOGIN_URL,
+    BrowserExecutable,
     BrowserLoginError,
-    DirectQrLoginManager,
-    _render_qr_png,
-    _validate_qr_value,
+    IsolatedBrowserLoginManager,
+    _browser_argv,
+    _CdpConnection,
+    _cookie_header_from_cdp,
+    _remove_profile,
+    _validate_cdp_request,
 )
-from xhs_insight.platform import FailureKind, RedNoteProtocolError
-
-_MISSING = object()
+from xhs_insight.domain import AdapterErrorCode
 
 
-class _FakeDirectClient:
-    def __init__(
-        self,
-        statuses: list[int] | None = None,
-        *,
-        geo_zone: Any = _MISSING,
-    ) -> None:
-        self.statuses = list(statuses or [0, 2])
-        self.geo_zone = geo_zone
-        self.calls: list[str] = []
+class _FakeBrowser:
+    def __init__(self, cookies: list[str | None] | None = None) -> None:
+        self.cookies = list(cookies or [None, "a1=secret-a1; web_session=secret-session"])
         self.closed = False
-        self.cookies = {"a1": "guest-a1", "web_session": "guest-session"}
+        self.running = True
+        self.cookie_calls = 0
 
-    def login_activate(self) -> dict[str, Any]:
-        self.calls.append("activate")
-        return {"guest": True}
+    def is_running(self) -> bool:
+        return self.running and not self.closed
 
-    def create_qr(self) -> dict[str, str]:
-        self.calls.append("create")
-        return {
-            "qr_id": "private-qr-id",
-            "code": "private-qr-code",
-            "url": "https://www.xiaohongshu.com/login/qr?private-token",
-        }
-
-    def poll_qr(self, _qr_id: str, _code: str) -> dict[str, Any]:
-        self.calls.append("poll")
-        status = self.statuses.pop(0) if self.statuses else 0
-        result: dict[str, Any] = {"codeStatus": status}
-        if self.geo_zone is not _MISSING:
-            result["geoZone"] = self.geo_zone
-        if status == 2 and self.geo_zone is _MISSING:
-            self.cookies["web_session"] = "formal-secret-session"
-        return result
-
-    def complete_qr(self, _qr_id: str, _code: str) -> dict[str, Any]:
-        self.calls.append("complete")
-        self.cookies["web_session"] = "formal-secret-session"
-        return {"login_info": {"session": "formal-secret-session"}}
-
-    def get_user_me(self) -> dict[str, Any]:
-        self.calls.append("user-me")
-        return {"guest": False, "user_id": "verified-user"}
-
-    def cookie_header(self) -> str:
-        return "; ".join(f"{key}={value}" for key, value in self.cookies.items())
+    def cookie_header(self) -> str | None:
+        self.cookie_calls += 1
+        if self.cookies:
+            return self.cookies.pop(0)
+        return None
 
     def close(self) -> None:
-        self.calls.append("close")
         self.closed = True
+
+
+def _executable(tmp_path: Path) -> BrowserExecutable:
+    return BrowserExecutable(tmp_path / "fixed-browser", "Synthetic Chrome")
 
 
 def _manager(
     tmp_path: Path,
     importer: Any,
-    fake: _FakeDirectClient,
+    browser: _FakeBrowser,
     *,
     active_jobs: Any = lambda: False,
-) -> DirectQrLoginManager:
-    return DirectQrLoginManager(
+) -> IsolatedBrowserLoginManager:
+    manager = IsolatedBrowserLoginManager(
         tmp_path,
         importer,
         active_jobs,
-        client_factory=lambda: fake,
         poll_seconds=0.1,
     )
+    manager._executable = _executable(tmp_path)
+    manager._browser_factory = lambda _executable, _state_dir: browser
+    return manager
 
 
 def _wait_for(
-    manager: DirectQrLoginManager, statuses: set[str], timeout: float = 4
+    manager: IsolatedBrowserLoginManager,
+    statuses: set[str],
+    timeout: float = 4,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -95,42 +83,29 @@ def _wait_for(
         if status["status"] in statuses:
             return status
         time.sleep(0.01)
-    raise AssertionError(f"direct QR login did not reach {statuses}: {manager.status()}")
+    raise AssertionError(f"browser login did not reach {statuses}: {manager.status()}")
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        "https://www.xiaohongshu.com/login/qr?token",
-    ],
-)
-def test_qr_value_is_validated_and_rendered_locally(value: str) -> None:
-    assert _validate_qr_value(value) == value
-    image = _render_qr_png(value)
-    assert image.startswith(b"\x89PNG\r\n\x1a\n")
-    assert len(image) < 1_000_000
+def test_launch_command_is_fixed_visible_isolated_and_secret_free(tmp_path: Path) -> None:
+    executable = _executable(tmp_path)
+    profile = tmp_path / "temporary-profile"
+
+    argv = _browser_argv(executable, profile)
+
+    assert argv[0] == str(executable.path)
+    assert argv[-1] == OFFICIAL_LOGIN_URL
+    assert "--remote-debugging-address=127.0.0.1" in argv
+    assert "--remote-debugging-port=0" in argv
+    assert f"--user-data-dir={profile}" in argv
+    assert "--new-window" in argv
+    assert not any(flag in argv for flag in ("--headless", "--no-sandbox", "--disable-web-security"))
+    assert not any("cookie" in value.casefold() or "web_session" in value for value in argv)
+    constructor = inspect.signature(IsolatedBrowserLoginManager).parameters
+    assert "executable" not in constructor
+    assert "browser_factory" not in constructor
 
 
-@pytest.mark.parametrize(
-    "value",
-    [
-        "javascript:alert(1)",
-        "xhsdiscover://login/qr?token",
-        "http://www.xiaohongshu.com/login/qr?token",
-        "https://attacker.invalid/login/qr?token",
-        "file:///private/token",
-        "https://",
-        "xhsdiscover:///missing-host",
-        "https://www.xiaohongshu.com/\nsecret",
-        "x" * 4097,
-    ],
-)
-def test_qr_value_rejects_unbounded_or_non_url_input(value: str) -> None:
-    with pytest.raises(BrowserLoginError, match="二维码"):
-        _validate_qr_value(value)
-
-
-def test_direct_qr_source_has_no_remote_execution_or_browser_transport() -> None:
+def test_source_uses_no_page_script_execution_or_default_profile() -> None:
     source_path = Path(__file__).resolve().parents[2] / "src/xhs_insight/browser_login.py"
     source = source_path.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -141,417 +116,321 @@ def test_direct_qr_source_has_no_remote_execution_or_browser_transport() -> None
     }
     assert not ({"eval", "exec", "compile"} & called_names)
     for forbidden in (
-        "subprocess",
-        "devtools",
-        "websocket",
-        "generate_websectiga",
-        "runInThisContext",
+        "Runtime.evaluate",
+        "document.cookie",
+        "localStorage",
+        "Network.getResponseBody",
+        "--no-sandbox",
+        "--disable-web-security",
+        "--remote-allow-origins",
     ):
-        assert forbidden.casefold() not in source.casefold()
+        assert forbidden not in source
+    assert '"Network.getCookies"' in source
+    assert '{"urls": [COOKIE_SOURCE_URL]}' in source
+    assert "tempfile.mkdtemp" in source
 
 
-def test_manager_publishes_only_png_then_persists_verified_cookie(tmp_path: Path) -> None:
-    fake = _FakeDirectClient()
+def test_minimal_loopback_websocket_round_trip_uses_cdp_request_ids() -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+    except PermissionError:
+        listener.close()
+        pytest.skip("sandbox does not permit loopback listeners")
+    listener.listen(1)
+    port = int(listener.getsockname()[1])
     observed: dict[str, Any] = {}
 
-    def importer(cookie: str, cancelled: Any) -> dict[str, Any]:
+    def server() -> None:
+        def receive_exact(connection: socket.socket, size: int) -> bytes:
+            payload = bytearray()
+            while len(payload) < size:
+                payload.extend(connection.recv(size - len(payload)))
+            return bytes(payload)
+
+        connection, _address = listener.accept()
+        with connection:
+            request = bytearray()
+            while b"\r\n\r\n" not in request:
+                request.extend(connection.recv(4096))
+            headers: dict[str, str] = {}
+            for line in bytes(request).split(b"\r\n")[1:]:
+                name, separator, value = line.partition(b":")
+                if separator:
+                    headers[name.decode("ascii").casefold()] = value.decode("ascii").strip()
+            key = headers["sec-websocket-key"]
+            accept = base64.b64encode(
+                hashlib.sha1(
+                    (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii"),
+                    usedforsecurity=False,
+                ).digest()
+            ).decode("ascii")
+            connection.sendall(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode("ascii")
+            )
+            first, second = receive_exact(connection, 2)
+            assert first & 0x0F == 1
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", receive_exact(connection, 2))[0]
+            mask = receive_exact(connection, 4)
+            payload = receive_exact(connection, length)
+            decoded = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+            observed.update(json.loads(decoded))
+            response = json.dumps(
+                {"id": observed["id"], "result": {"cookies": []}},
+                separators=(",", ":"),
+            ).encode("ascii")
+            connection.sendall(bytes((0x81, len(response))) + response)
+
+    thread = threading.Thread(target=server, daemon=True)
+    thread.start()
+    client = _CdpConnection(port, "/devtools/browser/abcdefgh")
+    try:
+        result = client.call(
+            "Network.getCookies",
+            {"urls": [COOKIE_SOURCE_URL]},
+            session_id="synthetic-session",
+        )
+    finally:
+        client.close()
+        listener.close()
+        thread.join(timeout=2)
+
+    assert result == {"cookies": []}
+    assert observed["method"] == "Network.getCookies"
+    assert observed["params"] == {"urls": [COOKIE_SOURCE_URL]}
+    assert observed["sessionId"] == "synthetic-session"
+
+
+@pytest.mark.parametrize(
+    ("method", "params", "session_id"),
+    [
+        ("Runtime.evaluate", {"expression": "document.cookie"}, "session"),
+        ("Storage.getCookies", {}, "session"),
+        ("Network.getCookies", {"urls": ["https://attacker.invalid"]}, "session"),
+        ("Network.getCookies", {"urls": [COOKIE_SOURCE_URL]}, None),
+        ("Target.getTargets", {"unexpected": True}, None),
+    ],
+)
+def test_cdp_capability_allowlist_rejects_unscoped_requests(
+    method: str,
+    params: dict[str, Any],
+    session_id: str | None,
+) -> None:
+    with pytest.raises(BrowserLoginError, match="安全范围"):
+        _validate_cdp_request(method, params, session_id)
+
+
+def test_cookie_selection_is_url_domain_scoped_allowlisted_and_bounded() -> None:
+    header = _cookie_header_from_cdp(
+        [
+            {"name": "a1", "value": "private-a1", "domain": ".xiaohongshu.com", "path": "/"},
+            {
+                "name": "web_session",
+                "value": "private-session",
+                "domain": ".xiaohongshu.com",
+                "path": "/",
+            },
+            {"name": "webId", "value": "private-web-id", "domain": "edith.xiaohongshu.com", "path": "/"},
+            {"name": "analytics", "value": "must-not-copy", "domain": ".xiaohongshu.com", "path": "/"},
+            {"name": "gid", "value": "attacker", "domain": ".attacker.invalid", "path": "/"},
+        ]
+    )
+
+    assert header is not None
+    assert "a1=private-a1" in header
+    assert "web_session=private-session" in header
+    assert "webId=private-web-id" in header
+    assert "analytics" not in header
+    assert "attacker" not in header
+
+
+def test_cookie_selection_requires_login_pair_and_prefers_specific_domain() -> None:
+    assert (
+        _cookie_header_from_cdp(
+            [{"name": "a1", "value": "only-a1", "domain": ".xiaohongshu.com", "path": "/"}]
+        )
+        is None
+    )
+    header = _cookie_header_from_cdp(
+        [
+            {"name": "a1", "value": "parent", "domain": ".xiaohongshu.com", "path": "/"},
+            {"name": "a1", "value": "specific", "domain": "edith.xiaohongshu.com", "path": "/"},
+            {"name": "web_session", "value": "session", "domain": ".xiaohongshu.com", "path": "/"},
+        ]
+    )
+    assert header is not None
+    assert "a1=specific" in header
+    assert "a1=parent" not in header
+
+
+def test_manager_opens_browser_then_persists_only_after_existing_verifier(
+    tmp_path: Path,
+) -> None:
+    browser = _FakeBrowser()
+    observed: dict[str, str] = {}
+
+    def importer(
+        cookie: str,
+        cancelled: Any,
+        before_persist: Any,
+    ) -> dict[str, Any]:
         assert cancelled() is False
         observed["cookie"] = cookie
+        before_persist()
         return {"authenticated": True, "account_fingerprint": "safe"}
 
-    manager = _manager(tmp_path, importer, fake)
+    manager = _manager(tmp_path, importer, browser)
     started = manager.start()
-    assert "private" not in repr(started)
-    assert started["failure_stage"] is None
+    assert started["browser_login_mode"] == "official_isolated_browser"
+    assert started["browser_login_embedded_qr"] is False
+    assert started["qr_url"] is None
+    assert "secret" not in repr(started)
 
-    awaiting = _wait_for(manager, {"awaiting_scan", "succeeded"})
-    if awaiting["status"] == "awaiting_scan":
-        image, revision = manager.qr_image()
-        assert image.startswith(b"\x89PNG")
-        assert len(revision) == 16
     result = _wait_for(manager, {"succeeded"})
 
     assert result["authenticated"] is True
+    assert result["qr_ready"] is False
     assert result["failure_stage"] is None
-    assert "private" not in repr(result)
-    assert "formal-secret-session" in observed["cookie"]
-    assert fake.calls == [
-        "activate",
-        "create",
-        "poll",
-        "poll",
-        "user-me",
-        "close",
-    ]
-    assert fake.closed is True
-    with pytest.raises(BrowserLoginError, match="二维码"):
-        manager.qr_image()
+    assert "secret" not in repr(result)
+    assert observed["cookie"] == "a1=secret-a1; web_session=secret-session"
+    assert browser.closed is True
 
 
-def test_scanned_qr_waits_for_optional_phone_verification(tmp_path: Path) -> None:
-    fake = _FakeDirectClient(statuses=[1, 1, 2])
-    manager = _manager(
-        tmp_path,
-        lambda _cookie, _cancelled: {"authenticated": True},
-        fake,
-    )
+def test_unverified_guest_cookie_waits_for_changed_verified_cookie(tmp_path: Path) -> None:
+    guest = "a1=guest-a1; web_session=guest-session"
+    formal = "a1=formal-a1; web_session=formal-session"
+    browser = _FakeBrowser([guest, guest, formal])
+    attempted: list[str] = []
 
+    def importer(cookie: str, _cancelled: Any, before_persist: Any) -> dict[str, Any]:
+        attempted.append(cookie)
+        if cookie == guest:
+            raise AdapterError(AdapterErrorCode.AUTH_EXPIRED)
+        before_persist()
+        return {"authenticated": True}
+
+    manager = _manager(tmp_path, importer, browser)
     manager.start()
-    waiting = _wait_for(manager, {"awaiting_phone_confirmation"})
-
-    assert waiting["authenticated"] is False
-    assert waiting["qr_ready"] is False
-    assert waiting["qr_url"] is None
-    assert "短信验证" in waiting["message"]
-    assert "手机端完成" in waiting["message"]
-
     result = _wait_for(manager, {"succeeded"})
+
     assert result["authenticated"] is True
+    assert attempted == [guest, formal]
+    assert browser.cookie_calls >= 3
+    assert browser.closed is True
 
 
-def test_phone_confirmation_extends_deadline_once_and_remains_bounded(
-    tmp_path: Path,
-) -> None:
-    fake = _FakeDirectClient(statuses=[0, *([1] * 100)])
+def test_manager_cancel_closes_browser_and_never_imports(tmp_path: Path) -> None:
+    browser = _FakeBrowser([None] * 100)
     manager = _manager(
         tmp_path,
-        lambda _cookie, _cancelled: {"authenticated": True},
-        fake,
+        lambda *_args: pytest.fail("cancelled login must not import a Cookie"),
+        browser,
     )
-
     manager.start()
-    waiting = _wait_for(manager, {"awaiting_phone_confirmation"})
-    session = manager._session
-    assert session is not None
-    first_deadline = session.deadline
-    first_expiry = waiting["expires_at"]
-    remaining = first_deadline - time.monotonic()
-    assert 295 <= remaining <= 300
+    waiting = _wait_for(manager, {"awaiting_login"})
+    assert waiting["qr_ready"] is False
 
-    time.sleep(0.35)
-
-    assert manager._session is session
-    assert session.deadline == first_deadline
-    assert manager.status()["expires_at"] == first_expiry
     manager.cancel()
-    _wait_for(manager, {"cancelled"})
-
-
-def test_manager_cancel_clears_qr_and_never_imports(tmp_path: Path) -> None:
-    fake = _FakeDirectClient(statuses=[0])
-    manager = _manager(
-        tmp_path,
-        lambda *_args: pytest.fail("cancelled login must not persist credentials"),
-        fake,
-    )
-    manager.start()
-    _wait_for(manager, {"awaiting_scan"})
-    assert manager.status()["qr_ready"] is True
-
-    cancelled = manager.cancel()
-    assert cancelled["qr_ready"] is False
     result = _wait_for(manager, {"cancelled"})
 
-    assert result["status"] == "cancelled"
-    assert fake.closed is True
-    with pytest.raises(BrowserLoginError, match="二维码"):
-        manager.qr_image()
+    assert result["authenticated"] is False
+    assert browser.closed is True
 
 
-class _GuestClient(_FakeDirectClient):
-    def get_user_me(self) -> dict[str, Any]:
-        self.calls.append("user-me")
-        return {"guest": True, "user_id": "guest"}
+def test_manager_reports_closed_browser_without_internal_details(tmp_path: Path) -> None:
+    browser = _FakeBrowser([None])
+    browser.running = False
+    manager = _manager(tmp_path, lambda *_args: {}, browser)
 
-
-def test_guest_session_is_never_persisted(tmp_path: Path) -> None:
-    fake = _GuestClient()
-    manager = _manager(
-        tmp_path,
-        lambda *_args: pytest.fail("guest session must not persist"),
-        fake,
-    )
     manager.start()
     result = _wait_for(manager, {"failed"})
 
-    assert result["error_code"] == "AUTH_VERIFY_FAILED"
-    assert result["qr_ready"] is False
+    assert result["error_code"] == "BROWSER_CLOSED"
+    assert result["failure_stage"] == "browser_login"
+    for marker in (str(tmp_path), "DevTools", "127.0.0.1", "web_session"):
+        assert marker not in repr(result)
 
 
-def test_manager_refuses_to_start_while_jobs_are_active(tmp_path: Path) -> None:
-    manager = _manager(
+def test_profile_cleanup_failure_blocks_success_and_stays_redacted(tmp_path: Path) -> None:
+    class CleanupFailBrowser(_FakeBrowser):
+        def close(self) -> None:
+            self.closed = True
+            raise BrowserLoginError(
+                "BROWSER_PROFILE_CLEANUP_FAILED",
+                "临时浏览器资料未能安全清理，请关闭官方窗口后重试。",
+            )
+
+    browser = CleanupFailBrowser(["a1=secret-a1; web_session=secret-session"])
+
+    def importer(_cookie: str, _cancelled: Any, before_persist: Any) -> dict[str, Any]:
+        before_persist()
+        pytest.fail("cleanup failure must prevent persistence")
+
+    manager = _manager(tmp_path, importer, browser)
+    manager.start()
+    result = _wait_for(manager, {"failed"})
+
+    assert result["error_code"] == "BROWSER_PROFILE_CLEANUP_FAILED"
+    assert result["authenticated"] is False
+    assert "secret" not in repr(result)
+
+
+def test_manager_refuses_active_jobs_and_missing_browser(tmp_path: Path) -> None:
+    active = _manager(
         tmp_path,
         lambda *_args: {},
-        _FakeDirectClient(),
+        _FakeBrowser(),
         active_jobs=lambda: True,
     )
-
     with pytest.raises(PermissionError, match="任务"):
-        manager.start()
+        active.start()
 
-    assert manager.status()["failure_stage"] is None
+    missing = IsolatedBrowserLoginManager(
+        tmp_path,
+        lambda *_args: {},
+        lambda: False,
+    )
+    missing._executable = None
+    assert missing.capability()["browser_login_supported"] is False
+    with pytest.raises(BrowserLoginError) as captured:
+        missing.start()
+    assert captured.value.code == "BROWSER_NOT_FOUND"
 
 
-@pytest.mark.parametrize(
-    ("failure_stage", "method_name"),
-    [
-        ("login_activate", "login_activate"),
-        ("qr_create", "create_qr"),
-        ("qr_poll", "poll_qr"),
-        ("qr_complete", "complete_qr"),
-        ("user_identity", "get_user_me"),
-    ],
-)
-def test_failure_status_exposes_only_fixed_stage_and_error_code(
+def test_disabled_embedded_qr_never_returns_browser_state(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, lambda *_args: {}, _FakeBrowser())
+
+    with pytest.raises(BrowserLoginError) as captured:
+        manager.qr_image()
+
+    assert captured.value.code == "BROWSER_CONTROL_FAILED"
+    assert "二维码" in captured.value.public_message
+
+
+def test_profile_cleanup_removes_disposable_cookie_store(tmp_path: Path) -> None:
+    profile = tmp_path / ".browser-login-test"
+    profile.mkdir()
+    (profile / "Cookies").write_bytes(b"private-cookie-material")
+
+    assert _remove_profile(profile) is True
+
+    assert not profile.exists()
+    assert COOKIE_SOURCE_URL.endswith("/api/sns/web/v2/user/me")
+
+
+def test_profile_cleanup_reports_a_locked_residual(
     tmp_path: Path,
-    failure_stage: str,
-    method_name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FailingClient(_FakeDirectClient):
-        pass
+    profile = tmp_path / ".browser-login-locked"
+    profile.mkdir()
+    monkeypatch.setattr("xhs_insight.browser_login.shutil.rmtree", lambda _path: None)
+    monkeypatch.setattr("xhs_insight.browser_login.time.sleep", lambda _seconds: None)
 
-    def fail(*_args: Any, **_kwargs: Any) -> Any:
-        raise RedNoteProtocolError(
-            FailureKind.RISK_CONTROL,
-            "operation-with-private-qr-id-and-verifyuuid",
-            status_code=461,
-            upstream_code=300015,
-        )
-
-    fake = FailingClient(
-        statuses=[2],
-        geo_zone=0 if method_name == "complete_qr" else _MISSING,
-    )
-    setattr(fake, method_name, fail)
-    if method_name == "complete_qr":
-        fake.get_user_me = lambda: {"guest": True, "user_id": "guest"}  # type: ignore[method-assign]
-    manager = _manager(
-        tmp_path,
-        lambda _cookie, _cancelled: {"authenticated": True},
-        fake,
-    )
-
-    manager.start()
-    result = _wait_for(manager, {"failed"})
-
-    assert result["failure_stage"] == failure_stage
-    assert result["error_code"] == "PLATFORM_RISK_REJECTED"
-    public = repr(result)
-    assert "private-qr-id" not in public
-    assert "verifyuuid" not in public
-    assert "300015" not in public
-    assert "461" not in public
-
-
-def test_geo_zone_null_fails_closed_without_completion(tmp_path: Path) -> None:
-    fake = _FakeDirectClient(statuses=[2], geo_zone=None)
-    manager = _manager(
-        tmp_path,
-        lambda *_args: pytest.fail("null route must not persist credentials"),
-        fake,
-    )
-
-    manager.start()
-    result = _wait_for(manager, {"failed"})
-
-    assert result["error_code"] == "UPSTREAM_SCHEMA_CHANGED"
-    assert "complete" not in fake.calls
-    assert "user-me" not in fake.calls
-
-
-def test_domestic_geo_zone_completes_before_identity_check(tmp_path: Path) -> None:
-    fake = _FakeDirectClient(statuses=[2], geo_zone=0)
-    manager = _manager(
-        tmp_path,
-        lambda cookie, _cancelled: {"authenticated": "formal-secret-session" in cookie},
-        fake,
-    )
-
-    manager.start()
-    result = _wait_for(manager, {"succeeded"})
-
-    assert result["authenticated"] is True
-    assert fake.calls.count("complete") == 1
-    assert fake.calls.count("user-me") == 1
-
-
-@pytest.mark.parametrize("geo_zone", [1, 2])
-def test_cross_region_geo_zone_fails_closed_without_completion(
-    tmp_path: Path, geo_zone: int
-) -> None:
-    fake = _FakeDirectClient(statuses=[2], geo_zone=geo_zone)
-    manager = _manager(
-        tmp_path,
-        lambda *_args: pytest.fail("unsupported route must not persist credentials"),
-        fake,
-    )
-
-    manager.start()
-    result = _wait_for(manager, {"failed"})
-
-    assert result["error_code"] == "UPSTREAM_UNSUPPORTED"
-    assert result["failure_stage"] == "qr_complete"
-    assert "complete" not in fake.calls
-    assert "user-me" not in fake.calls
-
-
-@pytest.mark.parametrize("geo_zone", [True, "0", 9])
-def test_unknown_geo_zone_fails_closed_without_completion(tmp_path: Path, geo_zone: Any) -> None:
-    fake = _FakeDirectClient(statuses=[2], geo_zone=geo_zone)
-    manager = _manager(
-        tmp_path,
-        lambda *_args: pytest.fail("unknown route must not persist credentials"),
-        fake,
-    )
-
-    manager.start()
-    result = _wait_for(manager, {"failed"})
-
-    expected = "UPSTREAM_SCHEMA_CHANGED" if type(geo_zone) is not int else "UPSTREAM_UNSUPPORTED"
-    assert result["error_code"] == expected
-    assert "complete" not in fake.calls
-    assert "user-me" not in fake.calls
-
-
-def test_completion_protocol_error_checks_identity_exactly_once(tmp_path: Path) -> None:
-    class CompletionRejectedClient(_FakeDirectClient):
-        def poll_qr(self, qr_id: str, code: str) -> dict[str, Any]:
-            result = super().poll_qr(qr_id, code)
-            if result["codeStatus"] == 2:
-                self.cookies["web_session"] = "formal-secret-session"
-            return result
-
-        def complete_qr(self, _qr_id: str, _code: str) -> dict[str, Any]:
-            self.calls.append("complete")
-            raise RedNoteProtocolError(
-                FailureKind.RISK_CONTROL,
-                "QR complete",
-                status_code=461,
-            )
-
-    fake = CompletionRejectedClient(statuses=[2], geo_zone=0)
-    manager = _manager(
-        tmp_path,
-        lambda cookie, _cancelled: {"authenticated": "formal-secret-session" in cookie},
-        fake,
-    )
-
-    manager.start()
-    result = _wait_for(manager, {"succeeded"})
-
-    assert result["authenticated"] is True
-    assert fake.calls.count("complete") == 1
-    assert fake.calls.count("user-me") == 1
-
-
-@pytest.mark.parametrize(
-    ("status_code", "upstream_code", "expected"),
-    [
-        (471, None, "PLATFORM_CHALLENGE_REQUIRED"),
-        (461, None, "PLATFORM_RISK_REJECTED"),
-        (406, None, "CLIENT_INTEGRITY_REJECTED"),
-        (None, 300015, "CLIENT_INTEGRITY_REJECTED"),
-        (None, 300012, "NETWORK_OR_IP_BLOCKED"),
-        (None, 300013, "RATE_LIMITED"),
-        (429, None, "RATE_LIMITED"),
-        (None, 429, "RATE_LIMITED"),
-    ],
-)
-def test_protocol_metadata_maps_to_fixed_public_classification(
-    tmp_path: Path,
-    status_code: int | None,
-    upstream_code: int | None,
-    expected: str,
-) -> None:
-    class FailingClient(_FakeDirectClient):
-        poll_calls = 0
-
-        def poll_qr(self, _qr_id: str, _code: str) -> dict[str, int]:
-            self.poll_calls += 1
-            raise RedNoteProtocolError(
-                FailureKind.RISK_CONTROL,
-                "QR poll",
-                status_code=status_code,
-                upstream_code=upstream_code,
-            )
-
-    fake = FailingClient(statuses=[2])
-    manager = _manager(
-        tmp_path,
-        lambda _cookie, _cancelled: {"authenticated": True},
-        fake,
-    )
-
-    manager.start()
-    result = _wait_for(manager, {"failed"})
-
-    assert result["failure_stage"] == "qr_poll"
-    assert result["error_code"] == expected
-    expected_phrases = {
-        "CLIENT_INTEGRITY_REJECTED": "客户端完整性",
-        "NETWORK_OR_IP_BLOCKED": "网络或 IP",
-        "PLATFORM_CHALLENGE_REQUIRED": "额外网页验证",
-        "PLATFORM_RISK_REJECTED": "当前登录请求",
-        "RATE_LIMITED": "限制",
-    }
-    assert expected_phrases[expected] in result["message"]
-    assert fake.poll_calls == 1
-    public = repr(result)
-    if status_code is not None:
-        assert str(status_code) not in public
-    if upstream_code is not None:
-        assert str(upstream_code) not in public
-
-
-def test_unknown_exception_code_and_message_are_not_reflected(tmp_path: Path) -> None:
-    class UnsafeKind:
-        value = "risk_control"
-
-    class UnsafeError(RuntimeError):
-        kind = UnsafeKind()
-        code = "verifyuuid-secret-value"
-
-    class UnsafeClient(_FakeDirectClient):
-        def poll_qr(self, _qr_id: str, _code: str) -> dict[str, int]:
-            raise UnsafeError("raw response with cookie-secret and QR token")
-
-    manager = _manager(
-        tmp_path,
-        lambda _cookie, _cancelled: {"authenticated": True},
-        UnsafeClient(statuses=[2]),
-    )
-
-    manager.start()
-    result = _wait_for(manager, {"failed"})
-
-    assert result["failure_stage"] == "qr_poll"
-    assert result["error_code"] == "RISK_CONTROLLED"
-    public = repr(result)
-    assert "verifyuuid-secret-value" not in public
-    assert "cookie-secret" not in public
-    assert "QR token" not in public
-
-
-def test_unknown_browser_error_is_replaced_with_generic_failure(tmp_path: Path) -> None:
-    class UnsafeClient(_FakeDirectClient):
-        def create_qr(self) -> dict[str, str]:
-            raise BrowserLoginError(
-                "verifyuuid-secret-value",
-                "raw response with cookie-secret and QR token",
-            )
-
-    manager = _manager(
-        tmp_path,
-        lambda _cookie, _cancelled: {"authenticated": True},
-        UnsafeClient(),
-    )
-
-    manager.start()
-    result = _wait_for(manager, {"failed"})
-
-    assert result["failure_stage"] == "qr_create"
-    assert result["error_code"] == "DIRECT_QR_FAILED"
-    public = repr(result)
-    assert "verifyuuid-secret-value" not in public
-    assert "cookie-secret" not in public
-    assert "QR token" not in public
+    assert _remove_profile(profile) is False
