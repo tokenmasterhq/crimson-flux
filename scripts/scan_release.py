@@ -115,6 +115,7 @@ _BROWSER_AUTOMATION_RE = re.compile(
 _FORBIDDEN_CANONICAL_BROWSER_RE = re.compile(
     rb"(?:"
     rb"\bRuntime\s*\.\s*(?:evaluate|callFunctionOn)\b"
+    rb"|\bNetwork\s*\.\s*enable\b"
     rb"|\b(?:Network|Fetch)\s*\.\s*getResponseBody\b"
     rb"|\b(?:Storage\s*\.\s*getCookies|Network\s*\.\s*getAllCookies)\b"
     rb"|\b(?:localStorage|sessionStorage)\b"

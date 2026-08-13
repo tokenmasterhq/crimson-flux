@@ -24,6 +24,7 @@ from xhs_insight.browser_login import (
     _browser_argv,
     _CdpConnection,
     _cookie_header_from_cdp,
+    _IsolatedBrowserSession,
     _remove_profile,
     _validate_cdp_request,
 )
@@ -123,11 +124,103 @@ def test_source_uses_no_page_script_execution_or_default_profile() -> None:
         "--no-sandbox",
         "--disable-web-security",
         "--remote-allow-origins",
+        "Network.enable",
     ):
         assert forbidden not in source
     assert '"Network.getCookies"' in source
     assert '{"urls": [COOKIE_SOURCE_URL]}' in source
     assert "tempfile.mkdtemp" in source
+
+
+def test_session_initialization_does_not_enable_network_events_and_cookie_read_still_works(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, Any], str | None]] = []
+    cookie_payload = [
+        {"name": "a1", "value": "private-a1", "domain": ".xiaohongshu.com", "path": "/"},
+        {
+            "name": "web_session",
+            "value": "private-session",
+            "domain": ".xiaohongshu.com",
+            "path": "/",
+        },
+    ]
+
+    class FakeProcess:
+        def poll(self) -> None:
+            return None
+
+        def terminate(self) -> None:
+            return None
+
+        def wait(self, timeout: float) -> int:
+            assert timeout > 0
+            return 0
+
+    class FakeConnection:
+        def __init__(self, _port: int, _path: str) -> None:
+            return None
+
+        def call(
+            self,
+            method: str,
+            params: dict[str, Any] | None = None,
+            *,
+            session_id: str | None = None,
+        ) -> dict[str, Any]:
+            calls.append((method, dict(params or {}), session_id))
+            if method == "Target.getTargets":
+                return {
+                    "targetInfos": [
+                        {
+                            "type": "page",
+                            "url": OFFICIAL_LOGIN_URL,
+                            "targetId": "official-page",
+                        }
+                    ]
+                }
+            if method == "Target.attachToTarget":
+                return {"sessionId": "official-session"}
+            if method == "Network.getCookies":
+                return {"cookies": cookie_payload}
+            raise AssertionError(f"unexpected CDP method: {method}")
+
+        def close(self) -> None:
+            return None
+
+    executable = _executable(tmp_path)
+    monkeypatch.setattr(
+        "xhs_insight.browser_login.subprocess.Popen",
+        lambda *_args, **_kwargs: FakeProcess(),
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._read_devtools_endpoint",
+        lambda *_args, **_kwargs: (49152, "/devtools/browser/abcdefgh"),
+    )
+    monkeypatch.setattr("xhs_insight.browser_login._CdpConnection", FakeConnection)
+
+    session = _IsolatedBrowserSession(executable, tmp_path)
+    try:
+        assert [method for method, _params, _session_id in calls] == [
+            "Target.getTargets",
+            "Target.attachToTarget",
+        ]
+        assert session.cookie_header() == "a1=private-a1; web_session=private-session"
+    finally:
+        session.close()
+
+    assert [method for method, _params, _session_id in calls] == [
+        "Target.getTargets",
+        "Target.attachToTarget",
+        "Network.getCookies",
+    ]
+    assert calls[-1] == (
+        "Network.getCookies",
+        {"urls": [COOKIE_SOURCE_URL]},
+        "official-session",
+    )
+    assert all(method != "Network.enable" for method, _params, _session_id in calls)
 
 
 def test_minimal_loopback_websocket_round_trip_uses_cdp_request_ids() -> None:
@@ -210,6 +303,7 @@ def test_minimal_loopback_websocket_round_trip_uses_cdp_request_ids() -> None:
 @pytest.mark.parametrize(
     ("method", "params", "session_id"),
     [
+        ("Network.enable", {}, "session"),
         ("Runtime.evaluate", {"expression": "document.cookie"}, "session"),
         ("Storage.getCookies", {}, "session"),
         ("Network.getCookies", {"urls": ["https://attacker.invalid"]}, "session"),

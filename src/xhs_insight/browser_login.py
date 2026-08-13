@@ -252,8 +252,6 @@ def _validate_cdp_request(
             and params.get("flatten") is True
             and session_id is None
         )
-    elif method == "Network.enable":
-        valid = not params and isinstance(session_id, str) and 1 <= len(session_id) <= 256
     elif method == "Network.getCookies":
         valid = (
             params == {"urls": [COOKIE_SOURCE_URL]}
@@ -421,7 +419,8 @@ class _CdpConnection:
                 )
             return result
         raise BrowserLoginError(
-            "BROWSER_CONTROL_FAILED", "官方浏览器登录状态响应超过本地安全限制。"
+            "BROWSER_CONTROL_FAILED",
+            "登录页面返回的信息过多，本次读取已安全停止。请关闭登录窗口后重试。",
         )
 
     def close(self) -> None:
@@ -561,7 +560,6 @@ class _IsolatedBrowserSession:
             )
             self._connection = _CdpConnection(port, path)
             self._session_id = self._attach_official_page(endpoint_deadline)
-            self._connection.call("Network.enable", session_id=self._session_id)
         except BrowserLoginError:
             self.close()
             raise
