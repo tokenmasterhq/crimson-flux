@@ -122,6 +122,7 @@ _FORBIDDEN_CANONICAL_BROWSER_RE = re.compile(
     rb"|--no-sandbox\b"
     rb"|--disable-web-security\b"
     rb"|--remote-allow-origins\s*=\s*\*"
+    rb"|[\"']/IM[\"']"
     rb")",
     re.IGNORECASE,
 )
@@ -277,9 +278,30 @@ def _python_security_findings(relative: PurePosixPath, payload: bytes) -> list[F
 
     if relative == _CANONICAL_BROWSER_LOGIN:
         for node in ast.walk(tree):
+            if isinstance(node, ast.Subscript) and _qualified_name(node.value) == "os.environ":
+                findings.append(
+                    Finding(
+                        path,
+                        "canonical browser executable discovery uses environment or PATH input",
+                    )
+                )
+                break
             if not isinstance(node, ast.Call):
                 continue
             call_name = _qualified_name(node.func) or ""
+            if call_name in {
+                "os.getenv",
+                "os.get_exec_path",
+                "os.path.expandvars",
+                "shutil.which",
+            } or call_name.startswith("os.environ."):
+                findings.append(
+                    Finding(
+                        path,
+                        "canonical browser executable discovery uses environment or PATH input",
+                    )
+                )
+                break
             if call_name in {"os.system", "os.popen"}:
                 findings.append(Finding(path, "canonical browser login uses a shell launcher"))
                 break
@@ -288,16 +310,32 @@ def _python_security_findings(relative: PurePosixPath, payload: bytes) -> list[F
                     keyword
                     for keyword in node.keywords
                     if keyword.arg == "shell"
-                    and not (
-                        isinstance(keyword.value, ast.Constant)
-                        and keyword.value.value is False
-                    )
                 ]
-                if shell_keywords:
+                explicit_shell_false = (
+                    len(shell_keywords) == 1
+                    and isinstance(shell_keywords[0].value, ast.Constant)
+                    and shell_keywords[0].value.value is False
+                )
+                if not explicit_shell_false:
                     findings.append(
-                        Finding(path, "canonical browser login may not enable subprocess shell")
+                        Finding(path, "canonical browser login must explicitly disable subprocess shell")
                     )
                     break
+                if call_name == "subprocess.run":
+                    keywords = {
+                        keyword.arg: keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg is not None
+                    }
+                    redacted_io = all(
+                        _qualified_name(keywords.get(name)) == "subprocess.DEVNULL"
+                        for name in ("stdin", "stdout", "stderr")
+                    )
+                    if "timeout" not in keywords or not redacted_io:
+                        findings.append(
+                            Finding(path, "browser helper process lacks bounded redacted I/O")
+                        )
+                        break
     return findings
 
 

@@ -7,7 +7,7 @@ import json
 import os
 import secrets
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
@@ -96,21 +96,27 @@ class Backend:
                 raise PermissionError("扫码登录已取消，登录态未保存")
             # The isolated browser supplies a cleanup barrier here.  Its CDP
             # endpoint, process and temporary profile must be gone before the
-            # verified credential can become available to collection jobs.
+            # verified credential can become available to collection jobs. A
+            # browser-login callback may return a commit guard that linearizes
+            # the final stop check, persistence, and committed marker.
+            commit_guard: Any = nullcontext()
             if callable(before_persist):
-                before_persist()
-            if self.repository.has_running_or_queued_jobs():
-                raise PermissionError("验证期间已有任务开始运行，登录态未保存")
-            if callable(cancelled) and cancelled():
-                raise PermissionError("扫码登录已取消，登录态未保存")
-            self.adapter.close()
-            return self.auth.persist_verified_login(
-                cookie=verified.cookie,
-                account_id=verified.account_id,
-                host_cookies=verified.host_cookies,
-                host_cookie_state=verified.host_cookie_state,
-                cookie_source_url=verified.cookie_source_url,
-            )
+                candidate_guard = before_persist()
+                if candidate_guard is not None:
+                    commit_guard = candidate_guard
+            with commit_guard:
+                if self.repository.has_running_or_queued_jobs():
+                    raise PermissionError("验证期间已有任务开始运行，登录态未保存")
+                if callable(cancelled) and cancelled():
+                    raise PermissionError("扫码登录已取消，登录态未保存")
+                self.adapter.close()
+                return self.auth.persist_verified_login(
+                    cookie=verified.cookie,
+                    account_id=verified.account_id,
+                    host_cookies=verified.host_cookies,
+                    host_cookie_state=verified.host_cookie_state,
+                    cookie_source_url=verified.cookie_source_url,
+                )
 
     def clear_all(self) -> None:
         # JobService refuses this operation while work is queued/running.
