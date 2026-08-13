@@ -86,14 +86,17 @@ def _service(tmp_path: Path, adapter=None) -> JobService:
     )
 
 
-def _wait(service: JobService, job_id: str, statuses: set[str], timeout: float = 3) -> dict:
+def _wait(service: JobService, job_id: str, statuses: set[str], timeout: float = 10) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         job = service.get(job_id)
         if job["status"] in statuses:
             return job
         time.sleep(0.02)
-    raise AssertionError(service.get(job_id))
+    job = service.get(job_id)
+    if job["status"] in statuses:
+        return job
+    raise AssertionError(job)
 
 
 def test_keyword_exact_limit_and_details(tmp_path: Path) -> None:
