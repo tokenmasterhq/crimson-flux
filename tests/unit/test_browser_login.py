@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ast
 import base64
+import ctypes
 import hashlib
 import inspect
 import json
 import socket
 import struct
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -16,17 +18,24 @@ import pytest
 
 from xhs_insight.adapters import AdapterError
 from xhs_insight.browser_login import (
+    _WINDOWS_KNOWN_FOLDER_IDS,
     COOKIE_SOURCE_URL,
     OFFICIAL_LOGIN_URL,
     BrowserExecutable,
     BrowserLoginError,
     IsolatedBrowserLoginManager,
     _browser_argv,
+    _browser_candidates,
     _CdpConnection,
     _cookie_header_from_cdp,
     _IsolatedBrowserSession,
+    _LoginSession,
     _remove_profile,
+    _terminate_browser_process,
     _validate_cdp_request,
+    _windows_known_folder_path,
+    _windows_known_folder_roots,
+    _windows_taskkill_path,
 )
 from xhs_insight.domain import AdapterErrorCode
 
@@ -106,6 +115,140 @@ def test_launch_command_is_fixed_visible_isolated_and_secret_free(tmp_path: Path
     assert "browser_factory" not in constructor
 
 
+def test_windows_known_folder_api_returns_path_and_frees_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backing = ctypes.create_unicode_buffer(r"C:\Trusted Apps")
+    address = ctypes.cast(backing, ctypes.c_void_p).value
+    freed: list[int | None] = []
+    loaded: list[tuple[str, dict[str, Any]]] = []
+
+    class Function:
+        argtypes: Any = None
+        restype: Any = None
+
+        def __init__(self, implementation: Any) -> None:
+            self.implementation = implementation
+
+        def __call__(self, *args: Any) -> Any:
+            return self.implementation(*args)
+
+    def resolve(_folder: Any, _flags: int, _token: Any, output: Any) -> int:
+        ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = address
+        return 0
+
+    shell32 = type("Shell32", (), {"SHGetKnownFolderPath": Function(resolve)})()
+    ole32 = type(
+        "Ole32",
+        (),
+        {
+            "CoTaskMemFree": Function(
+                lambda pointer: freed.append(ctypes.cast(pointer, ctypes.c_void_p).value)
+            )
+        },
+    )()
+
+    def load(name: str, **kwargs: Any) -> Any:
+        loaded.append((name, kwargs))
+        return shell32 if name == "shell32.dll" else ole32
+
+    monkeypatch.setattr("xhs_insight.browser_login.ctypes.WinDLL", load, raising=False)
+
+    result = _windows_known_folder_path(_WINDOWS_KNOWN_FOLDER_IDS[0])
+
+    assert str(result).replace("\\", "/") == "C:/Trusted Apps"
+    assert freed == [address]
+    assert [name for name, _kwargs in loaded] == ["shell32.dll", "ole32.dll"]
+    assert all(kwargs["winmode"] == 0x00000800 for _name, kwargs in loaded)
+
+
+def test_windows_known_folder_failure_frees_any_returned_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backing = ctypes.create_unicode_buffer(r"C:\Must Not Execute")
+    address = ctypes.cast(backing, ctypes.c_void_p).value
+    freed: list[int | None] = []
+
+    class Function:
+        argtypes: Any = None
+        restype: Any = None
+
+        def __init__(self, implementation: Any) -> None:
+            self.implementation = implementation
+
+        def __call__(self, *args: Any) -> Any:
+            return self.implementation(*args)
+
+    def fail(_folder: Any, _flags: int, _token: Any, output: Any) -> int:
+        ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p))[0] = address
+        return -1
+
+    shell32 = type("Shell32", (), {"SHGetKnownFolderPath": Function(fail)})()
+    ole32 = type(
+        "Ole32",
+        (),
+        {
+            "CoTaskMemFree": Function(
+                lambda pointer: freed.append(ctypes.cast(pointer, ctypes.c_void_p).value)
+            )
+        },
+    )()
+    monkeypatch.setattr(
+        "xhs_insight.browser_login.ctypes.WinDLL",
+        lambda name, **_kwargs: shell32 if name == "shell32.dll" else ole32,
+        raising=False,
+    )
+
+    assert _windows_known_folder_path(_WINDOWS_KNOWN_FOLDER_IDS[0]) is None
+    assert freed == [address]
+
+
+def test_windows_candidates_use_known_folder_roots_and_fixed_suffixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROGRAMFILES", r"D:\attacker")
+    monkeypatch.setenv("PROGRAMFILES(X86)", r"D:\attacker-x86")
+    monkeypatch.setenv("LOCALAPPDATA", r"D:\attacker-user")
+    monkeypatch.setattr("xhs_insight.browser_login.platform.system", lambda: "Windows")
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_known_folder_roots",
+        lambda: (Path("C:/Trusted/SystemApps"), Path("C:/Trusted/UserApps")),
+    )
+
+    candidates = _browser_candidates()
+    rendered = [str(item.path).replace("\\", "/") for item in candidates]
+
+    assert len(rendered) == 6
+    assert all(path.startswith("C:/Trusted/") for path in rendered)
+    assert not any("attacker" in path.casefold() for path in rendered)
+    assert all(
+        path.endswith(
+            (
+                "/Google/Chrome/Application/chrome.exe",
+                "/Microsoft/Edge/Application/msedge.exe",
+                "/Chromium/Application/chrome.exe",
+            )
+        )
+        for path in rendered
+    )
+
+
+def test_windows_known_folder_api_failure_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PROGRAMFILES", r"D:\attacker")
+    monkeypatch.setenv("LOCALAPPDATA", r"D:\attacker-user")
+    monkeypatch.setattr("xhs_insight.browser_login.platform.system", lambda: "Windows")
+    monkeypatch.setattr(
+        "xhs_insight.browser_login.ctypes.WinDLL",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("unavailable")),
+        raising=False,
+    )
+
+    assert _windows_known_folder_roots() == ()
+    assert _browser_candidates() == ()
+
+
 def test_source_uses_no_page_script_execution_or_default_profile() -> None:
     source_path = Path(__file__).resolve().parents[2] / "src/xhs_insight/browser_login.py"
     source = source_path.read_text(encoding="utf-8")
@@ -148,11 +291,14 @@ def test_session_initialization_does_not_enable_network_events_and_cookie_read_s
     ]
 
     class FakeProcess:
-        def poll(self) -> None:
-            return None
+        def __init__(self) -> None:
+            self.running = True
+
+        def poll(self) -> int | None:
+            return None if self.running else 0
 
         def terminate(self) -> None:
-            return None
+            self.running = False
 
         def wait(self, timeout: float) -> int:
             assert timeout > 0
@@ -221,6 +367,120 @@ def test_session_initialization_does_not_enable_network_events_and_cookie_read_s
         "official-session",
     )
     assert all(method != "Network.enable" for method, _params, _session_id in calls)
+
+
+def test_windows_close_uses_bounded_taskkill_tree_before_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[Any] = []
+
+    class WindowsProcess:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.running = True
+
+        def poll(self) -> int | None:
+            events.append("poll")
+            return None if self.running else 0
+
+        def terminate(self) -> None:
+            raise AssertionError("Windows must not terminate the root before taskkill /T")
+
+        def kill(self) -> None:
+            events.append("kill")
+            self.running = False
+
+        def wait(self, timeout: float) -> int:
+            events.append(("wait", timeout))
+            return 0
+
+    def taskkill(command: list[str], **kwargs: Any) -> Any:
+        events.append(("taskkill", command, kwargs))
+        return type("Result", (), {"returncode": 1})()
+
+    process = WindowsProcess()
+    monkeypatch.setattr("xhs_insight.browser_login.platform.system", lambda: "Windows")
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_taskkill_path",
+        lambda: Path("C:/Windows/System32/taskkill.exe"),
+    )
+    monkeypatch.setattr("xhs_insight.browser_login.subprocess.run", taskkill)
+
+    _terminate_browser_process(process)  # type: ignore[arg-type]
+
+    taskkill_event = next(event for event in events if isinstance(event, tuple) and event[0] == "taskkill")
+    assert taskkill_event[1] == [
+        "C:/Windows/System32/taskkill.exe",
+        "/PID",
+        "4242",
+        "/T",
+        "/F",
+    ]
+    assert taskkill_event[2]["shell"] is False
+    assert taskkill_event[2]["timeout"] == 12.0
+    assert taskkill_event[2]["stdin"] is subprocess.DEVNULL
+    assert taskkill_event[2]["stdout"] is subprocess.DEVNULL
+    assert taskkill_event[2]["stderr"] is subprocess.DEVNULL
+    assert "kill" in events
+    assert ("wait", 3) in events
+
+
+def test_windows_taskkill_timeout_has_bounded_direct_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[Any] = []
+
+    class WindowsProcess:
+        pid = 5151
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+        @staticmethod
+        def kill() -> None:
+            events.append("kill")
+
+        @staticmethod
+        def wait(timeout: float) -> int:
+            events.append(("wait", timeout))
+            return 0
+
+    def timeout(*_args: Any, **_kwargs: Any) -> Any:
+        events.append("taskkill-timeout")
+        raise subprocess.TimeoutExpired("taskkill", 12)
+
+    monkeypatch.setattr("xhs_insight.browser_login.platform.system", lambda: "Windows")
+    monkeypatch.setattr("xhs_insight.browser_login.subprocess.run", timeout)
+
+    _terminate_browser_process(WindowsProcess())  # type: ignore[arg-type]
+
+    assert events == ["taskkill-timeout", "kill", ("wait", 3)]
+
+
+def test_windows_taskkill_path_rejects_relative_environment_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYSTEMROOT", "attacker-controlled-relative")
+    monkeypatch.delenv("WINDIR", raising=False)
+
+    result = str(_windows_taskkill_path()).replace("/", "\\")
+
+    assert result.casefold() == "c:\\windows\\system32\\taskkill.exe"
+    assert "attacker-controlled" not in result
+
+
+def test_windows_taskkill_path_ignores_absolute_environment_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYSTEMROOT", "D:\\attacker\\controlled")
+    monkeypatch.setenv("WINDIR", "D:\\attacker\\controlled")
+
+    result = str(_windows_taskkill_path()).replace("/", "\\")
+
+    assert result.casefold().endswith("\\system32\\taskkill.exe")
+    assert "attacker" not in result.casefold()
 
 
 def test_minimal_loopback_websocket_round_trip_uses_cdp_request_ids() -> None:
@@ -368,6 +628,7 @@ def test_manager_opens_browser_then_persists_only_after_existing_verifier(
 ) -> None:
     browser = _FakeBrowser()
     observed: dict[str, str] = {}
+    manager_holder: dict[str, IsolatedBrowserLoginManager] = {}
 
     def importer(
         cookie: str,
@@ -376,10 +637,13 @@ def test_manager_opens_browser_then_persists_only_after_existing_verifier(
     ) -> dict[str, Any]:
         assert cancelled() is False
         observed["cookie"] = cookie
-        before_persist()
-        return {"authenticated": True, "account_fingerprint": "safe"}
+        commit_guard = before_persist()
+        with commit_guard:
+            observed["cleanup_message"] = manager_holder["manager"].status()["message"]
+            return {"authenticated": True, "account_fingerprint": "safe"}
 
     manager = _manager(tmp_path, importer, browser)
+    manager_holder["manager"] = manager
     started = manager.start()
     assert started["browser_login_mode"] == "official_isolated_browser"
     assert started["browser_login_embedded_qr"] is False
@@ -393,6 +657,9 @@ def test_manager_opens_browser_then_persists_only_after_existing_verifier(
     assert result["failure_stage"] is None
     assert "secret" not in repr(result)
     assert observed["cookie"] == "a1=secret-a1; web_session=secret-session"
+    assert observed["cleanup_message"] == (
+        "账号验证通过，正在安全关闭临时浏览器并保存登录状态…"
+    )
     assert browser.closed is True
 
 
@@ -406,8 +673,9 @@ def test_unverified_guest_cookie_waits_for_changed_verified_cookie(tmp_path: Pat
         attempted.append(cookie)
         if cookie == guest:
             raise AdapterError(AdapterErrorCode.AUTH_EXPIRED)
-        before_persist()
-        return {"authenticated": True}
+        commit_guard = before_persist()
+        with commit_guard:
+            return {"authenticated": True}
 
     manager = _manager(tmp_path, importer, browser)
     manager.start()
@@ -417,6 +685,172 @@ def test_unverified_guest_cookie_waits_for_changed_verified_cookie(tmp_path: Pat
     assert attempted == [guest, formal]
     assert browser.cookie_calls >= 3
     assert browser.closed is True
+
+
+def test_verification_crossing_deadline_finishes_expired_not_succeeded(
+    tmp_path: Path,
+) -> None:
+    browser = _FakeBrowser(["a1=formal-a1; web_session=formal-session"])
+    manager_holder: dict[str, IsolatedBrowserLoginManager] = {}
+
+    def importer(
+        _cookie: str,
+        stopped: Any,
+        _before_persist: Any,
+    ) -> dict[str, Any]:
+        assert stopped() is False
+        active = manager_holder["manager"]._session
+        assert active is not None
+        active.deadline = time.monotonic() - 1
+        assert stopped() is True
+        raise PermissionError("stopped before persistence")
+
+    manager = _manager(tmp_path, importer, browser)
+    manager_holder["manager"] = manager
+    manager.start()
+    result = _wait_for(manager, {"expired"})
+
+    assert result["status"] == "expired"
+    assert result["authenticated"] is False
+    assert result["error_code"] == "LOGIN_EXPIRED"
+    assert browser.closed is True
+
+
+def test_cancel_during_bounded_verification_cannot_publish_success(tmp_path: Path) -> None:
+    browser = _FakeBrowser(["a1=formal-a1; web_session=formal-session"])
+    importer_entered = threading.Event()
+    importer_release = threading.Event()
+
+    def importer(
+        _cookie: str,
+        stopped: Any,
+        _before_persist: Any,
+    ) -> dict[str, Any]:
+        importer_entered.set()
+        assert importer_release.wait(timeout=2)
+        assert stopped() is True
+        raise PermissionError("cancelled before persistence")
+
+    manager = _manager(tmp_path, importer, browser)
+    manager.start()
+    assert importer_entered.wait(timeout=2)
+    manager.cancel()
+    importer_release.set()
+    result = _wait_for(manager, {"cancelled"})
+
+    assert result["authenticated"] is False
+    assert result["error_code"] is None
+    assert browser.closed is True
+
+
+def test_persist_commit_wins_and_concurrent_cancel_reports_succeeded(
+    tmp_path: Path,
+) -> None:
+    browser = _FakeBrowser(["a1=formal-a1; web_session=formal-session"])
+    persist_entered = threading.Event()
+    persist_release = threading.Event()
+    cancel_finished = threading.Event()
+    cancel_result: dict[str, Any] = {}
+
+    def importer(
+        _cookie: str,
+        _stopped: Any,
+        before_persist: Any,
+    ) -> dict[str, Any]:
+        commit_guard = before_persist()
+        with commit_guard:
+            persist_entered.set()
+            assert persist_release.wait(timeout=2)
+            return {"authenticated": True}
+
+    manager = _manager(tmp_path, importer, browser)
+    manager.start()
+    assert persist_entered.wait(timeout=2)
+
+    def cancel() -> None:
+        cancel_result.update(manager.cancel())
+        cancel_finished.set()
+
+    cancel_thread = threading.Thread(target=cancel)
+    cancel_thread.start()
+    assert cancel_finished.wait(timeout=0.1) is False
+    persist_release.set()
+    cancel_thread.join(timeout=2)
+
+    assert cancel_finished.is_set()
+    assert cancel_result["status"] == "succeeded"
+    assert cancel_result["authenticated"] is True
+    assert manager.status()["status"] == "succeeded"
+    assert manager._session is not None
+    assert manager._session.committed is True
+    assert manager._session.cancel_event.is_set() is False
+
+
+def test_deadline_status_closes_browser_while_verifier_is_blocked(
+    tmp_path: Path,
+) -> None:
+    browser = _FakeBrowser(["a1=formal-a1; web_session=formal-session"])
+    verifier_entered = threading.Event()
+    verifier_release = threading.Event()
+
+    def importer(
+        _cookie: str,
+        stopped: Any,
+        _before_persist: Any,
+    ) -> dict[str, Any]:
+        verifier_entered.set()
+        assert verifier_release.wait(timeout=2)
+        assert stopped() is True
+        raise PermissionError("deadline won before commit")
+
+    manager = _manager(tmp_path, importer, browser)
+    manager.start()
+    assert verifier_entered.wait(timeout=2)
+    assert manager._session is not None
+    manager._session.deadline = time.monotonic() - 1
+
+    expired = manager.status()
+
+    assert expired["status"] == "expired"
+    assert expired["authenticated"] is False
+    assert browser.closed is True
+    verifier_release.set()
+    result = _wait_for(manager, {"expired"})
+    assert result["status"] == "expired"
+
+
+def test_deadline_wins_after_cleanup_and_commit_guard_rejects_late_persist(
+    tmp_path: Path,
+) -> None:
+    browser = _FakeBrowser(["a1=formal-a1; web_session=formal-session"])
+    guard_ready = threading.Event()
+    commit_release = threading.Event()
+    persisted = threading.Event()
+
+    def importer(
+        _cookie: str,
+        _stopped: Any,
+        before_persist: Any,
+    ) -> dict[str, Any]:
+        commit_guard = before_persist()
+        guard_ready.set()
+        assert commit_release.wait(timeout=2)
+        with commit_guard:
+            persisted.set()
+            return {"authenticated": True}
+
+    manager = _manager(tmp_path, importer, browser)
+    manager.start()
+    assert guard_ready.wait(timeout=2)
+    assert manager._session is not None
+    manager._session.deadline = time.monotonic() - 1
+    assert manager.status()["status"] == "expired"
+    commit_release.set()
+    result = _wait_for(manager, {"expired"})
+
+    assert result["authenticated"] is False
+    assert persisted.is_set() is False
+    assert manager._session.committed is False
 
 
 def test_manager_cancel_closes_browser_and_never_imports(tmp_path: Path) -> None:
@@ -475,6 +909,66 @@ def test_profile_cleanup_failure_blocks_success_and_stays_redacted(tmp_path: Pat
     assert "secret" not in repr(result)
 
 
+def test_non_browser_cleanup_error_is_terminal_and_retained_for_retry(
+    tmp_path: Path,
+) -> None:
+    class RetryCleanupBrowser(_FakeBrowser):
+        def __init__(self) -> None:
+            super().__init__(["a1=secret-a1; web_session=secret-session"])
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls <= 2:
+                raise OSError("synthetic locked profile")
+            self.closed = True
+
+    browser = RetryCleanupBrowser()
+
+    def importer(_cookie: str, _cancelled: Any, before_persist: Any) -> dict[str, Any]:
+        before_persist()
+        pytest.fail("cleanup failure must prevent persistence")
+
+    manager = _manager(tmp_path, importer, browser)
+    manager.start()
+    result = _wait_for(manager, {"failed"})
+
+    assert result["error_code"] == "BROWSER_PROFILE_CLEANUP_FAILED"
+    assert manager._session is not None
+    assert manager._session.browser is browser
+
+    cleared = manager.cancel()
+
+    assert cleared["status"] == "idle"
+    assert browser.closed is True
+    assert browser.close_calls == 3
+
+
+def test_dead_active_worker_self_heals_and_closes_retained_browser(tmp_path: Path) -> None:
+    browser = _FakeBrowser([None])
+    manager = _manager(tmp_path, lambda *_args: {}, browser)
+    dead_worker = threading.Thread(target=lambda: None)
+    dead_worker.start()
+    dead_worker.join(timeout=1)
+    now = time.time()
+    manager._session = _LoginSession(
+        internal_id="synthetic",
+        created_at=now,
+        deadline=time.monotonic() + 60,
+        expires_at="2099-01-01T00:00:00+00:00",
+        status="verifying",
+        thread=dead_worker,
+        browser=browser,
+    )
+
+    result = manager.status()
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "BROWSER_CONTROL_FAILED"
+    assert browser.closed is True
+    assert manager._session.browser is None
+
+
 def test_manager_refuses_active_jobs_and_missing_browser(tmp_path: Path) -> None:
     active = _manager(
         tmp_path,
@@ -528,3 +1022,20 @@ def test_profile_cleanup_reports_a_locked_residual(
     monkeypatch.setattr("xhs_insight.browser_login.time.sleep", lambda _seconds: None)
 
     assert _remove_profile(profile) is False
+
+
+def test_windows_profile_cleanup_uses_bounded_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / ".browser-login-windows-locked"
+    profile.mkdir()
+    delays: list[float] = []
+    monkeypatch.setattr("xhs_insight.browser_login.platform.system", lambda: "Windows")
+    monkeypatch.setattr("xhs_insight.browser_login.shutil.rmtree", lambda _path: None)
+    monkeypatch.setattr("xhs_insight.browser_login.time.sleep", delays.append)
+
+    assert _remove_profile(profile) is False
+
+    assert delays == [0.1, 0.2, 0.4, 0.8, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0]
+    assert sum(delays) == pytest.approx(12.0)

@@ -10,6 +10,7 @@ returned by the local API or written to logs.
 from __future__ import annotations
 
 import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -27,7 +28,8 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from types import TracebackType
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -66,6 +68,9 @@ _MAX_CDP_CALL_BYTES = 8 * 1024 * 1024
 _MAX_CDP_MESSAGES_PER_CALL = 256
 _MAX_COOKIE_BYTES = 16 * 1024
 _MAX_COOKIE_COUNT = 64
+_WINDOWS_TREE_KILL_TIMEOUT_SECONDS = 12.0
+_WINDOWS_PROFILE_CLEANUP_DELAYS = (0.1, 0.2, 0.4, 0.8, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0)
+_DEFAULT_PROFILE_CLEANUP_DELAYS = (0.05, 0.1, 0.2, 0.4)
 
 # These are the account/session and request-context cookies used by the fixed
 # local collector.  Analytics, preference and unrelated site cookies are not
@@ -128,6 +133,115 @@ class BrowserExecutable:
     name: str
 
 
+class _WindowsGuid(ctypes.Structure):
+    _fields_ = (
+        ("data1", ctypes.c_uint32),
+        ("data2", ctypes.c_uint16),
+        ("data3", ctypes.c_uint16),
+        ("data4", ctypes.c_ubyte * 8),
+    )
+
+
+_WINDOWS_KNOWN_FOLDER_IDS = (
+    "905e63b6-c1bf-494e-b29c-65b732d3d21a",
+    "7c5a40ef-a0fb-4bfc-874a-c0f2e0b9fa8e",
+    "f1b32785-6fba-4fcf-9d55-7b8e7f157091",
+)
+_WINDOWS_BROWSER_SUFFIXES = (
+    (PureWindowsPath("Google/Chrome/Application/chrome.exe"), "Google Chrome"),
+    (PureWindowsPath("Microsoft/Edge/Application/msedge.exe"), "Microsoft Edge"),
+    (PureWindowsPath("Chromium/Application/chrome.exe"), "Chromium"),
+)
+_LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800
+
+
+def _windows_guid(value: str) -> _WindowsGuid:
+    compact = value.replace("-", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{32}", compact):
+        raise ValueError("invalid Windows known-folder identifier")
+    data4 = bytes.fromhex(compact[16:])
+    return _WindowsGuid(
+        int(compact[0:8], 16),
+        int(compact[8:12], 16),
+        int(compact[12:16], 16),
+        (ctypes.c_ubyte * 8)(*data4),
+    )
+
+
+def _windows_known_folder_path(folder_id: str) -> Path | None:
+    """Resolve one trusted Known Folder and always release its OS allocation."""
+
+    try:
+        loader = getattr(ctypes, "WinDLL", None)
+        if not callable(loader):
+            return None
+        shell32 = loader(
+            "shell32.dll",
+            use_last_error=True,
+            winmode=_LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+        ole32 = loader(
+            "ole32.dll",
+            use_last_error=True,
+            winmode=_LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+        get_known_folder = shell32.SHGetKnownFolderPath
+        free_memory = ole32.CoTaskMemFree
+        get_known_folder.argtypes = (
+            ctypes.POINTER(_WindowsGuid),
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        get_known_folder.restype = ctypes.c_long
+        free_memory.argtypes = (ctypes.c_void_p,)
+        free_memory.restype = None
+        identifier = _windows_guid(folder_id)
+        allocated = ctypes.c_void_p()
+        try:
+            result = int(
+                get_known_folder(
+                    ctypes.byref(identifier),
+                    0,
+                    None,
+                    ctypes.byref(allocated),
+                )
+            )
+            if result != 0 or not allocated.value:
+                return None
+            raw = ctypes.wstring_at(allocated.value)
+        finally:
+            if allocated.value:
+                free_memory(allocated)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    if not raw or len(raw) > 32767 or any(ord(character) < 32 for character in raw):
+        return None
+    candidate = PureWindowsPath(raw)
+    if (
+        not candidate.is_absolute()
+        or not re.fullmatch(r"[A-Za-z]:", candidate.drive)
+        or candidate.root != "\\"
+        or any(part in {".", ".."} for part in candidate.parts)
+    ):
+        return None
+    return Path(candidate)
+
+
+def _windows_known_folder_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    observed: set[str] = set()
+    for folder_id in _WINDOWS_KNOWN_FOLDER_IDS:
+        root = _windows_known_folder_path(folder_id)
+        if root is None:
+            continue
+        normalized = str(root).replace("/", "\\").casefold().rstrip("\\")
+        if normalized not in observed:
+            observed.add(normalized)
+            roots.append(root)
+    return tuple(roots)
+
+
 def _browser_candidates() -> tuple[BrowserExecutable, ...]:
     """Return only fixed vendor locations; no environment override is accepted."""
 
@@ -148,20 +262,10 @@ def _browser_candidates() -> tuple[BrowserExecutable, ...]:
             ),
         )
     if system == "Windows":
-        roots = tuple(
-            Path(value)
-            for key in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
-            if (value := os.environ.get(key))
-        )
-        relative = (
-            (Path("Google/Chrome/Application/chrome.exe"), "Google Chrome"),
-            (Path("Microsoft/Edge/Application/msedge.exe"), "Microsoft Edge"),
-            (Path("Chromium/Application/chrome.exe"), "Chromium"),
-        )
         return tuple(
-            BrowserExecutable(root / path, name)
-            for root in roots
-            for path, name in relative
+            BrowserExecutable(root / Path(suffix), name)
+            for root in _windows_known_folder_roots()
+            for suffix, name in _WINDOWS_BROWSER_SUFFIXES
         )
     return (
         BrowserExecutable(Path("/usr/bin/google-chrome"), "Google Chrome"),
@@ -198,6 +302,92 @@ def _browser_argv(executable: BrowserExecutable, profile_dir: Path) -> list[str]
         "--new-window",
         OFFICIAL_LOGIN_URL,
     ]
+
+
+def _browser_creation_flags() -> int:
+    """Keep the disposable Windows browser in a distinct process group."""
+
+    if platform.system() != "Windows":
+        return 0
+    value = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return value if type(value) is int and value >= 0 else 0
+
+
+def _windows_taskkill_path() -> Path:
+    """Resolve only the operating-system taskkill binary, never PATH input."""
+
+    # Environment variables and PATH are attacker-controlled inputs here. Ask
+    # the Windows loader for its trusted system directory instead.  The fixed
+    # fallback is used only if that OS API is unavailable or returns malformed
+    # data (for example while unit tests execute on another platform).
+    try:
+        loader = getattr(ctypes, "windll", None)
+        kernel32 = getattr(loader, "kernel32", None)
+        get_system_directory = getattr(kernel32, "GetSystemDirectoryW", None)
+        if not callable(get_system_directory):
+            raise AttributeError("Windows system directory API unavailable")
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = int(get_system_directory(buffer, len(buffer)))
+        system_directory = buffer.value.rstrip("\\/")
+        if (
+            0 < length < len(buffer)
+            and re.fullmatch(
+                r"[A-Za-z]:\\[^:\r\n]+\\System32",
+                system_directory,
+                flags=re.IGNORECASE,
+            )
+        ):
+            return Path(system_directory + "\\taskkill.exe")
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return Path("C:\\Windows\\System32\\taskkill.exe")
+
+
+def _terminate_browser_process(process: subprocess.Popen[bytes]) -> None:
+    """Bound termination and, on Windows, close the whole Chrome process tree."""
+
+    if process.poll() is not None:
+        return
+    if platform.system() == "Windows":
+        pid = getattr(process, "pid", None)
+        if (
+            type(pid) is int
+            and 1 <= pid <= 2_147_483_647
+            and process.poll() is None
+        ):
+            with suppress(OSError, subprocess.TimeoutExpired):
+                subprocess.run(
+                    [
+                        str(_windows_taskkill_path()),
+                        "/PID",
+                        str(pid),
+                        "/T",
+                        "/F",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    shell=False,
+                    timeout=_WINDOWS_TREE_KILL_TIMEOUT_SECONDS,
+                )
+        # taskkill can be blocked by endpoint security.  Retain a bounded
+        # direct-process fallback so close() always progresses to cleanup.
+        if process.poll() is None:
+            with suppress(Exception):
+                process.kill()
+            with suppress(Exception):
+                process.wait(timeout=3)
+        return
+    with suppress(Exception):
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        with suppress(Exception):
+            process.kill()
+        with suppress(Exception):
+            process.wait(timeout=3)
 
 
 def _read_exact(sock: socket.socket, size: int, buffer: bytearray) -> bytes:
@@ -513,14 +703,23 @@ def _cookie_header_from_cdp(payload: Any) -> str | None:
 def _remove_profile(profile_dir: Path | None) -> bool:
     if profile_dir is None:
         return True
-    for _attempt in range(5):
+    delays = (
+        _WINDOWS_PROFILE_CLEANUP_DELAYS
+        if platform.system() == "Windows"
+        else _DEFAULT_PROFILE_CLEANUP_DELAYS
+    )
+    for delay in delays:
         with suppress(OSError):
             shutil.rmtree(profile_dir)
         if not profile_dir.exists():
             return True
-        time.sleep(0.1)
-    # Best effort hardening if Windows still has a transient lock.  No path is
-    # logged or returned; a future startup may remove the empty/locked shell.
+        time.sleep(delay)
+    with suppress(OSError):
+        shutil.rmtree(profile_dir)
+    if not profile_dir.exists():
+        return True
+    # Best-effort hardening if Windows still has a lock.  The owning session
+    # retains the path and process reference so a later close() can retry.
     with suppress(OSError):
         os.chmod(profile_dir, 0o700)
     return not profile_dir.exists()
@@ -551,6 +750,7 @@ class _IsolatedBrowserSession:
                 stderr=subprocess.DEVNULL,
                 shell=False,
                 close_fds=True,
+                creationflags=_browser_creation_flags(),
             )
             endpoint_deadline = time.monotonic() + max(3.0, min(launch_timeout, 30.0))
             port, path = _read_devtools_endpoint(
@@ -617,20 +817,19 @@ class _IsolatedBrowserSession:
 
     def close(self) -> None:
         with self._close_lock:
-            connection, self._connection = self._connection, None
+            connection = self._connection
             if connection is not None:
                 connection.close()
-            process, self._process = self._process, None
-            if process is not None and process.poll() is None:
-                with suppress(Exception):
-                    process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except (subprocess.TimeoutExpired, OSError):
-                    with suppress(Exception):
-                        process.kill()
-                    with suppress(Exception):
-                        process.wait(timeout=3)
+                self._connection = None
+                self._session_id = None
+            process = self._process
+            if process is not None:
+                _terminate_browser_process(process)
+                if process.poll() is None:
+                    raise BrowserLoginError(
+                        "BROWSER_PROFILE_CLEANUP_FAILED",
+                        "临时浏览器进程未能安全关闭，请关闭官方窗口后重试。",
+                    )
             profile = self._profile_dir
             if not _remove_profile(profile):
                 raise BrowserLoginError(
@@ -638,6 +837,7 @@ class _IsolatedBrowserSession:
                     "临时浏览器资料未能安全清理，请关闭官方窗口后重试。",
                 )
             self._profile_dir = None
+            self._process = None
 
 
 @dataclass(slots=True)
@@ -650,8 +850,46 @@ class _LoginSession:
     message: str = "正在打开隔离的官方登录窗口…"
     error_code: str | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    commit_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    committed: bool = field(default=False, repr=False)
     thread: threading.Thread | None = field(default=None, repr=False)
     browser: Any | None = field(default=None, repr=False)
+
+
+class _SessionCommitGuard:
+    """Linearize stop/deadline against the final credential commit."""
+
+    def __init__(self, session: _LoginSession) -> None:
+        self._session = session
+        self._entered = False
+
+    def __enter__(self) -> _SessionCommitGuard:
+        session = self._session
+        session.commit_lock.acquire()
+        if (
+            session.committed
+            or session.cancel_event.is_set()
+            or time.monotonic() >= session.deadline
+        ):
+            session.commit_lock.release()
+            raise PermissionError("网页登录已停止，登录态未保存")
+        self._entered = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc_value: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        if not self._entered:
+            return
+        try:
+            if exc_type is None:
+                self._session.committed = True
+        finally:
+            self._entered = False
+            self._session.commit_lock.release()
 
 
 class IsolatedBrowserLoginManager:
@@ -661,7 +899,7 @@ class IsolatedBrowserLoginManager:
         self,
         state_dir: Path,
         import_cookie: Callable[
-            [str, Callable[[], bool], Callable[[], None]], dict[str, Any]
+            [str, Callable[[], bool], Callable[[], Any]], dict[str, Any]
         ],
         active_jobs: Callable[[], bool],
         *,
@@ -722,9 +960,64 @@ class IsolatedBrowserLoginManager:
             "qr_url": None,
         }
 
+    def _close_session_browser(self, session: _LoginSession, browser: Any) -> None:
+        try:
+            browser.close()
+        except BrowserLoginError as error:
+            with session.commit_lock:
+                committed = session.committed
+            if not committed:
+                self._set_status(session, "failed", error.public_message, error.code)
+        except Exception:
+            with session.commit_lock:
+                committed = session.committed
+            if not committed:
+                self._set_status(
+                    session,
+                    "failed",
+                    "临时浏览器资料未能安全清理，请关闭官方窗口后重试。",
+                    "BROWSER_PROFILE_CLEANUP_FAILED",
+                )
+        else:
+            with self._lock:
+                if session.browser is browser:
+                    session.browser = None
+
     def status(self) -> dict[str, Any]:
+        cleanup: tuple[_LoginSession, Any] | None = None
         with self._lock:
-            return self._public()
+            current = self._session
+            if current is not None:
+                with current.commit_lock:
+                    if current.committed:
+                        current.status = "succeeded"
+                        current.message = "网页登录成功，登录态已验证并加密保存在本机。"
+                        current.error_code = None
+                    elif current.status in _ACTIVE_STATUSES:
+                        thread = current.thread
+                        if current.cancel_event.is_set():
+                            current.status = "cancelled"
+                            current.message = "已取消网页登录。"
+                            current.error_code = None
+                        elif time.monotonic() >= current.deadline:
+                            current.cancel_event.set()
+                            current.status = "expired"
+                            current.message = "网页登录已超时，请重新开始。"
+                            current.error_code = "LOGIN_EXPIRED"
+                            if current.browser is not None:
+                                cleanup = (current, current.browser)
+                        elif thread is not None and not thread.is_alive():
+                            current.cancel_event.set()
+                            current.status = "failed"
+                            current.message = "网页登录进程意外结束，请重新开始。"
+                            current.error_code = "BROWSER_CONTROL_FAILED"
+                            if current.browser is not None:
+                                cleanup = (current, current.browser)
+        if cleanup is not None:
+            session, browser = cleanup
+            self._close_session_browser(session, browser)
+        with self._lock:
+            return self._public(current)
 
     def qr_image(self) -> tuple[bytes, str]:
         raise BrowserLoginError(
@@ -747,6 +1040,10 @@ class IsolatedBrowserLoginManager:
                 )
 
     def start(self) -> dict[str, Any]:
+        # Reconcile an expired/dead prior worker before deciding whether a new
+        # login may start.  This also prevents an abandoned active state from
+        # blocking the API forever.
+        self.status()
         with self._lock:
             if self._active_jobs():
                 raise PermissionError("请先取消或暂停正在运行、排队的任务，再更换登录态")
@@ -755,8 +1052,23 @@ class IsolatedBrowserLoginManager:
                     "BROWSER_NOT_FOUND",
                     "未找到受支持的 Chrome、Edge 或 Chromium，请使用手动 Cookie 导入。",
                 )
-            if self._session is not None and self._session.status in _ACTIVE_STATUSES:
-                raise PermissionError("已有网页登录正在等待，请先完成或取消")
+            previous = self._session
+            if previous is not None:
+                if previous.status in _ACTIVE_STATUSES:
+                    raise PermissionError("已有网页登录正在等待，请先完成或取消")
+                if previous.thread is not None and previous.thread.is_alive():
+                    raise PermissionError("上一次网页登录正在安全结束，请稍后重试")
+                if previous.browser is not None:
+                    try:
+                        previous.browser.close()
+                    except BrowserLoginError:
+                        raise
+                    except Exception:
+                        raise BrowserLoginError(
+                            "BROWSER_PROFILE_CLEANUP_FAILED",
+                            "临时浏览器资料未能安全清理，请关闭官方窗口后重试。",
+                        ) from None
+                    previous.browser = None
             now = time.time()
             session = _LoginSession(
                 internal_id=secrets.token_urlsafe(24),
@@ -775,35 +1087,60 @@ class IsolatedBrowserLoginManager:
             return self._public(session)
 
     def cancel(self) -> dict[str, Any]:
-        browser: Any | None = None
         with self._lock:
             current = self._session
             if current is None:
                 return self._public()
-            if current.status in _ACTIVE_STATUSES:
-                current.cancel_event.set()
-                current.message = "正在取消网页登录…"
+            with current.commit_lock:
+                committed = current.committed
+                was_active = current.status in _ACTIVE_STATUSES
+                if committed:
+                    current.status = "succeeded"
+                    current.message = "网页登录成功，登录态已验证并加密保存在本机。"
+                    current.error_code = None
+                elif was_active:
+                    current.cancel_event.set()
+                    current.status = "cancelled"
+                    current.message = "已取消网页登录。"
+                    current.error_code = None
                 browser = current.browser
-                result = self._public(current)
-            else:
+                thread = current.thread
+        if browser is not None:
+            self._close_session_browser(current, browser)
+        with self._lock:
+            worker_alive = thread is not None and thread.is_alive()
+            cleanup_pending = current.browser is not None
+            if (
+                self._session is current
+                and not was_active
+                and not committed
+                and not worker_alive
+                and not cleanup_pending
+            ):
                 self._session = None
                 return self._public()
-        if browser is not None:
-            with suppress(Exception):
-                browser.close()
-        return result
+            return self._public(current)
 
     def close(self) -> None:
         with self._lock:
             current = self._session
             if current is None:
                 return
-            current.cancel_event.set()
-            browser = current.browser
-            thread = current.thread
+            with current.commit_lock:
+                if current.committed:
+                    current.status = "succeeded"
+                    current.message = "网页登录成功，登录态已验证并加密保存在本机。"
+                    current.error_code = None
+                else:
+                    current.cancel_event.set()
+                    if current.status in _ACTIVE_STATUSES:
+                        current.status = "cancelled"
+                        current.message = "已取消网页登录。"
+                        current.error_code = None
+                browser = current.browser
+                thread = current.thread
         if browser is not None:
-            with suppress(Exception):
-                browser.close()
+            self._close_session_browser(current, browser)
         if thread is not None and thread.is_alive():
             thread.join(timeout=10)
 
@@ -813,6 +1150,31 @@ class IsolatedBrowserLoginManager:
         last_candidate_hash: bytes | None = None
         last_verify_at = 0.0
         terminal: tuple[str, str, str | None] | None = None
+
+        def stopped() -> bool:
+            with session.commit_lock:
+                return not session.committed and (
+                    session.cancel_event.is_set()
+                    or time.monotonic() >= session.deadline
+                )
+
+        def cleanup_before_persist() -> _SessionCommitGuard:
+            if stopped():
+                raise PermissionError("网页登录已停止，登录态未保存")
+            assert browser is not None
+            self._set_status(
+                session,
+                "verifying",
+                "账号验证通过，正在安全关闭临时浏览器并保存登录状态…",
+            )
+            browser.close()
+            with self._lock:
+                if session.browser is browser:
+                    session.browser = None
+            if stopped():
+                raise PermissionError("网页登录已停止，登录态未保存")
+            return _SessionCommitGuard(session)
+
         try:
             if session.cancel_event.is_set():
                 raise _Cancelled
@@ -851,10 +1213,23 @@ class IsolatedBrowserLoginManager:
                         try:
                             result = self._import_cookie(
                                 candidate,
-                                session.cancel_event.is_set,
-                                browser.close,
+                                stopped,
+                                cleanup_before_persist,
                             )
                         except Exception as error:
+                            with session.commit_lock:
+                                committed = session.committed
+                            if committed:
+                                terminal = (
+                                    "succeeded",
+                                    "网页登录成功，登录态已验证并加密保存在本机。",
+                                    None,
+                                )
+                                break
+                            if session.cancel_event.is_set():
+                                raise _Cancelled from None
+                            if time.monotonic() >= session.deadline:
+                                raise _Expired from None
                             code = getattr(getattr(error, "code", None), "value", None) or getattr(
                                 error, "code", None
                             )
@@ -870,13 +1245,23 @@ class IsolatedBrowserLoginManager:
                             else:
                                 raise
                         else:
-                            if isinstance(result, Mapping) and result.get("authenticated") is True:
+                            with session.commit_lock:
+                                committed = session.committed
+                            if (
+                                committed
+                                and isinstance(result, Mapping)
+                                and result.get("authenticated") is True
+                            ):
                                 terminal = (
                                     "succeeded",
                                     "网页登录成功，登录态已验证并加密保存在本机。",
                                     None,
                                 )
                                 break
+                            if session.cancel_event.is_set():
+                                raise _Cancelled
+                            if time.monotonic() >= session.deadline:
+                                raise _Expired
                             raise BrowserLoginError(
                                 "AUTH_VERIFY_FAILED", "网页登录态未通过账号验证。"
                             )
@@ -891,11 +1276,20 @@ class IsolatedBrowserLoginManager:
                 "LOGIN_EXPIRED",
             )
         except PermissionError:
-            terminal = (
-                "failed",
-                "验证期间已有任务开始运行，登录态未保存。",
-                "CREDENTIAL_CHANGE_CONFLICT",
-            )
+            if session.cancel_event.is_set():
+                terminal = ("cancelled", "已取消网页登录。", None)
+            elif time.monotonic() >= session.deadline:
+                terminal = (
+                    "expired",
+                    "网页登录已超时，请重新开始。",
+                    "LOGIN_EXPIRED",
+                )
+            else:
+                terminal = (
+                    "failed",
+                    "验证期间已有任务开始运行，登录态未保存。",
+                    "CREDENTIAL_CHANGE_CONFLICT",
+                )
         except BrowserLoginError as error:
             terminal = (
                 ("cancelled", "已取消网页登录。", None)
@@ -929,22 +1323,41 @@ class IsolatedBrowserLoginManager:
             candidate = ""
             last_candidate_hash = None
             last_verify_at = 0.0
-            session.browser = None
             if browser is not None:
                 try:
                     browser.close()
                 except BrowserLoginError as cleanup_error:
+                    session.browser = browser
                     terminal = (
                         "failed",
                         cleanup_error.public_message,
                         cleanup_error.code,
                     )
-            if terminal is None:
-                terminal = (
-                    "failed",
-                    "网页登录未完成。",
-                    "BROWSER_CONTROL_FAILED",
-                )
+                except Exception:
+                    session.browser = browser
+                    terminal = (
+                        "failed",
+                        "临时浏览器资料未能安全清理，请关闭官方窗口后重试。",
+                        "BROWSER_PROFILE_CLEANUP_FAILED",
+                    )
+                else:
+                    session.browser = None
+            with session.commit_lock:
+                committed = session.committed
+                if committed:
+                    terminal = (
+                        "succeeded",
+                        "网页登录成功，登录态已验证并加密保存在本机。",
+                        None,
+                    )
+                elif terminal is None:
+                    terminal = (
+                        "failed",
+                        "网页登录未完成。",
+                        "BROWSER_CONTROL_FAILED",
+                    )
+                elif session.cancel_event.is_set() and terminal[0] == "succeeded":
+                    terminal = ("cancelled", "已取消网页登录。", None)
             self._set_status(session, terminal[0], terminal[1], terminal[2])
 
 

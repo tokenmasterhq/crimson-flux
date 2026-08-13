@@ -17,8 +17,8 @@ from typing import Any
 from scan_release import scan_g1_tree, scan_git_history, scan_source, source_file_paths
 
 ROOT = Path(__file__).resolve().parents[1]
-POLICY_VERSION = "crimsonflux-g1-v7-isolated-visible-browser"
-EVIDENCE_SCHEMA = "https://crimsonflux.local/schemas/g1-evidence-v7.json"
+POLICY_VERSION = "crimsonflux-g1-v9-windows-known-folder-executables"
+EVIDENCE_SCHEMA = "https://crimsonflux.local/schemas/g1-evidence-v9.json"
 
 
 def _digest(payload: bytes) -> str:
@@ -117,7 +117,8 @@ def _python_only_check(root: Path) -> dict[str, Any]:
 def _browser_login_check(root: Path) -> dict[str, Any]:
     browser_path = root / "src" / "xhs_insight" / "browser_login.py"
     adapter_path = root / "src" / "xhs_insight" / "adapters" / "rednote" / "live.py"
-    if not browser_path.is_file() or not adapter_path.is_file():
+    app_path = root / "src" / "xhs_insight" / "api" / "app.py"
+    if not browser_path.is_file() or not adapter_path.is_file() or not app_path.is_file():
         return {
             "name": "isolated_visible_browser_login_contract",
             "passed": False,
@@ -125,6 +126,7 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
         }
     browser = browser_path.read_bytes()
     adapter = adapter_path.read_bytes()
+    app = app_path.read_bytes()
     lowered = browser.lower()
     login_url = b'https://www.xiaohongshu.com/explore'
     cookie_source = b'https://edith.xiaohongshu.com/api/sns/web/v2/user/me'
@@ -135,6 +137,33 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
         "executable_allowlist": (
             b"def _browser_candidates(" in browser
             and b"def find_supported_browser(" in browser
+            and all(
+                suffix in browser
+                for suffix in (
+                    b"Google/Chrome/Application/chrome.exe",
+                    b"Microsoft/Edge/Application/msedge.exe",
+                    b"Chromium/Application/chrome.exe",
+                )
+            )
+        ),
+        "windows_known_folder_roots": (
+            any(
+                marker in browser
+                for marker in (b"SHGetKnownFolderPath", b"SHGetFolderPathW")
+            )
+            and not any(
+                marker in browser
+                for marker in (
+                    b"os.environ",
+                    b"os.getenv(",
+                    b"os.get_exec_path(",
+                    b"shutil.which(",
+                    b'"PROGRAMFILES"',
+                    b'"PROGRAMFILES(X86)"',
+                    b'"LOCALAPPDATA"',
+                    b'"PATH"',
+                )
+            )
         ),
         "isolated_profile": b"tempfile.mkdtemp(" in browser and b"--user-data-dir=" in browser,
         "profile_mode_0700": b"0o700" in browser and b"chmod(" in browser,
@@ -183,6 +212,35 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
             b"data = candidate.get_user_me()" in adapter
             and b"if guest is not False:" in adapter
             and b"account_id = str(data.get(" in adapter
+        ),
+        "cleanup_barrier_before_persist": (
+            0
+            <= app.find(b"verified = self.adapter.verify_cookie(cookie)")
+            < app.find(b"candidate_guard = before_persist()")
+            < app.find(b"with commit_guard:")
+            < app.find(b"return self.auth.persist_verified_login(")
+        ),
+        "cancel_and_deadline_guard_persist": (
+            b"def stopped() -> bool:" in browser
+            and b"class _SessionCommitGuard:" in browser
+            and b"session.commit_lock.acquire()" in browser
+            and b"session.cancel_event.is_set()" in browser
+            and b"time.monotonic() >= session.deadline" in browser
+            and b"self._session.committed = True" in browser
+            and b"stopped," in browser
+            and b"cleanup_before_persist," in browser
+            and b"return _SessionCommitGuard(session)" in browser
+            and b"with current.commit_lock:" in browser
+        ),
+        "windows_owned_process_tree_only": (
+            b"taskkill.exe" in browser
+            and b'"/PID"' in browser
+            and b'"/T"' in browser
+            and b'"/F"' in browser
+            and b'"/IM"' not in browser
+            and b'pid = getattr(process, "pid", None)' in browser
+            and b"type(pid) is int" in browser
+            and b"timeout=_WINDOWS_TREE_KILL_TIMEOUT_SECONDS" in browser
         ),
         "terminal_cleanup": (
             b"terminate(" in browser

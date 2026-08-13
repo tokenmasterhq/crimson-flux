@@ -90,6 +90,7 @@ def test_canonical_browser_module_may_contain_reviewed_cdp_transport() -> None:
         "--no-" + "sandbox",
         "--disable-" + "web-security",
         "--remote-allow-origins=" + "*",
+        '"/IM"',
     ],
 )
 def test_canonical_browser_module_rejects_expanded_capabilities(marker: str) -> None:
@@ -112,21 +113,70 @@ def test_canonical_browser_module_rejects_shell_launch() -> None:
     assert any("subprocess shell" in finding.reason for finding in findings)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"import os\nroot = os.environ.get('PROGRAMFILES')\n",
+        b"import os\nroot = os.getenv('LOCALAPPDATA')\n",
+        b"import os\nroot = os.environ['PROGRAMFILES(X86)']\n",
+        b"import shutil\nexecutable = shutil.which('chrome')\n",
+        b"import os\npaths = os.get_exec_path()\n",
+        b"import os\npath = os.path.expandvars(r'%PROGRAMFILES%\\Chrome')\n",
+    ],
+)
+def test_canonical_browser_module_rejects_environment_executable_roots(
+    source: bytes,
+) -> None:
+    findings = _scan_payload(PurePosixPath("src/xhs_insight/browser_login.py"), source)
+
+    assert any(
+        item.reason
+        == "canonical browser executable discovery uses environment or PATH input"
+        for item in findings
+    )
+
+
+def test_canonical_browser_module_requires_explicit_shell_false_and_bounded_helper_io() -> None:
+    missing_shell = b"import subprocess\nsubprocess.Popen(['browser'])\n"
+    unbounded_helper = (
+        b"import subprocess\n"
+        b"subprocess.run(['helper'], shell=False, stdin=None, stdout=None, "
+        b"stderr=None, timeout=12)\n"
+    )
+
+    findings = _scan_payload(PurePosixPath("src/xhs_insight/browser_login.py"), missing_shell)
+    assert any("explicitly disable subprocess shell" in item.reason for item in findings)
+
+    findings = _scan_payload(PurePosixPath("src/xhs_insight/browser_login.py"), unbounded_helper)
+    assert any("bounded redacted I/O" in item.reason for item in findings)
+
+
 def test_browser_login_g1_contract_requires_isolation_scope_verification_and_cleanup(
     tmp_path: Path,
 ) -> None:
     package = tmp_path / "src" / "xhs_insight"
     adapter_dir = package / "adapters" / "rednote"
     adapter_dir.mkdir(parents=True)
+    api_dir = package / "api"
+    api_dir.mkdir(parents=True)
     browser = package / "browser_login.py"
     adapter = adapter_dir / "live.py"
+    app = api_dir / "app.py"
     browser.write_text(
         '''
 import shutil
+import subprocess
 import tempfile
 
 OFFICIAL_LOGIN_URL = "https://www.xiaohongshu.com/explore"
 COOKIE_SOURCE_URL = "https://edith.xiaohongshu.com/api/sns/web/v2/user/me"
+WINDOWS_SUFFIXES = (
+    "Google/Chrome/Application/chrome.exe",
+    "Microsoft/Edge/Application/msedge.exe",
+    "Chromium/Application/chrome.exe",
+)
+def _windows_known_folders():
+    return SHGetKnownFolderPath(FOLDERID_ProgramFiles)
 def _browser_candidates():
     return ("fixed",)
 
@@ -155,12 +205,45 @@ class IsolatedBrowserLoginManager:
         )
         params = {"urls": [COOKIE_SOURCE_URL]}
         required = {"a1", "web_session"}
+        pid = getattr(process, "pid", None)
+        if type(pid) is int:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=_WINDOWS_TREE_KILL_TIMEOUT_SECONDS,
+                shell=False,
+            )
+        def stopped() -> bool:
+            return session.cancel_event.is_set() or time.monotonic() >= session.deadline
+        def cleanup_before_persist():
+            browser.close()
+            return _SessionCommitGuard(session)
+        result = self._import_cookie(
+            candidate,
+            stopped,
+            cleanup_before_persist,
+        )
+        with current.commit_lock:
+            committed = current.committed
         try:
             return flags, port_file, methods, params, required
         finally:
             process.terminate()
             process.kill()
             shutil.rmtree(profile)
+
+class _SessionCommitGuard:
+    def __enter__(self):
+        session.commit_lock.acquire()
+        if session.cancel_event.is_set() or time.monotonic() >= session.deadline:
+            raise PermissionError
+        return self
+
+    def __exit__(self, exc_type, _value, _traceback):
+        if exc_type is None:
+            self._session.committed = True
 ''',
         encoding="utf-8",
     )
@@ -182,6 +265,20 @@ class Backend:
 ''',
         encoding="utf-8",
     )
+    app.write_text(
+        '''
+class Backend:
+    def import_cookie(self, cookie, before_persist):
+        verified = self.adapter.verify_cookie(cookie)
+        commit_guard = nullcontext()
+        candidate_guard = before_persist()
+        if candidate_guard is not None:
+            commit_guard = candidate_guard
+        with commit_guard:
+            return self.auth.persist_verified_login(cookie=verified.cookie)
+''',
+        encoding="utf-8",
+    )
 
     detail = _browser_login_check(tmp_path)["detail"]
     assert all(detail.values()), detail
@@ -194,6 +291,38 @@ class Backend:
     )
 
     assert _browser_login_check(tmp_path)["detail"]["url_scoped_cookie_query"] is False
+
+    source = app.read_text(encoding="utf-8")
+    app.write_text(
+        source.replace(
+            "        with commit_guard:\n"
+            "            return self.auth.persist_verified_login(cookie=verified.cookie)",
+            "        result = self.auth.persist_verified_login(cookie=verified.cookie)\n"
+            "        with commit_guard:\n"
+            "            return result",
+        ),
+        encoding="utf-8",
+    )
+    assert _browser_login_check(tmp_path)["detail"]["cleanup_barrier_before_persist"] is False
+
+    browser.write_text(
+        browser.read_text(encoding="utf-8").replace(
+            "return SHGetKnownFolderPath(FOLDERID_ProgramFiles)",
+            "return os.environ.get('PROGRAMFILES')",
+        ),
+        encoding="utf-8",
+    )
+    assert _browser_login_check(tmp_path)["detail"]["windows_known_folder_roots"] is False
+
+    browser_source = browser.read_text(encoding="utf-8")
+    browser.write_text(
+        browser_source.replace("            self._session.committed = True\n", ""),
+        encoding="utf-8",
+    )
+    assert (
+        _browser_login_check(tmp_path)["detail"]["cancel_and_deadline_guard_persist"]
+        is False
+    )
 
 
 def test_full_tree_scan_rejects_non_release_dynamic_js(tmp_path: Path) -> None:

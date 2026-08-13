@@ -116,6 +116,75 @@ def test_backend_persists_only_the_adapter_verified_credential() -> None:
     assert events == ["verified", "profile-cleaned", "closed", "persisted"]
 
 
+def test_backend_wraps_final_checks_and_persist_in_returned_commit_guard() -> None:
+    verified = VerifiedLogin(
+        cookie="a1=verified-a1; web_session=verified-session",
+        account_id="account-1",
+    )
+    events: list[str] = []
+
+    class FakeRepository:
+        @staticmethod
+        def has_running_or_queued_jobs() -> bool:
+            events.append("jobs-checked")
+            return False
+
+    class FakeAdapter:
+        @staticmethod
+        def verify_cookie(_cookie: str) -> VerifiedLogin:
+            events.append("verified")
+            return verified
+
+        @staticmethod
+        def close() -> None:
+            events.append("adapter-closed")
+
+    class FakeAuth:
+        @staticmethod
+        def persist_verified_login(**_kwargs: object) -> dict[str, object]:
+            events.append("persisted")
+            return {"authenticated": True}
+
+    class CommitGuard:
+        def __enter__(self) -> None:
+            events.append("commit-enter")
+
+        def __exit__(self, *_args: object) -> None:
+            events.append("commit-exit")
+
+    backend = Backend(
+        settings=object(),  # type: ignore[arg-type]
+        repository=FakeRepository(),  # type: ignore[arg-type]
+        cipher=object(),  # type: ignore[arg-type]
+        auth=FakeAuth(),
+        adapter=FakeAdapter(),
+        exporter=object(),  # type: ignore[arg-type]
+        jobs=object(),  # type: ignore[arg-type]
+    )
+
+    def before_persist() -> CommitGuard:
+        events.append("profile-cleaned")
+        return CommitGuard()
+
+    result = backend.import_cookie(
+        "candidate",
+        before_persist=before_persist,
+    )
+
+    assert result == {"authenticated": True}
+    assert events == [
+        "jobs-checked",
+        "verified",
+        "jobs-checked",
+        "profile-cleaned",
+        "commit-enter",
+        "jobs-checked",
+        "adapter-closed",
+        "persisted",
+        "commit-exit",
+    ]
+
+
 def test_backend_never_persists_when_isolated_profile_cleanup_fails() -> None:
     verified = VerifiedLogin(
         cookie="a1=verified-a1; web_session=verified-session",

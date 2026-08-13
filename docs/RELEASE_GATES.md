@@ -34,7 +34,7 @@ G1 证明产品只运行锁定、可审计的 Python 代码：
 
 - 签名只通过 `xhshow==0.2.0` 的固定公开 API；禁止运行时下载、动态 import、备用 signer 或未锁定 patch；
 - 平台响应中的 program/script 是不可信数据，不能进入 `eval`、`exec`、`compile`、subprocess、文件、数据库或日志；
-- 浏览器登录只存在于规范模块；可执行文件、官方 URL 与 flags 固定，使用权限 `0700` 的随机临时 Profile，不读取默认 Profile；
+- 浏览器登录只存在于规范模块；可执行文件、官方 URL 与 flags 固定，使用权限 `0700` 的随机临时 Profile，不读取默认 Profile；Windows executable 根只可来自 Known Folder API 与源码固定 suffix，禁止环境变量和 PATH；
 - CDP 只绑定回环随机端口，只允许 `Target.getTargets`、`Target.attachToTarget` 与固定 `/user/me` URL scope 的 `Network.getCookies`；明确禁止 `Network.enable`、页面执行、响应正文、localStorage 和全局 Cookie 读取；
 - 禁止 shell、自定义 executable/flags、`--no-sandbox`、`--disable-web-security` 及其他扩大权限的回退；
 - 自动取得的 Cookie 必须经同一 `/user/me` 路径确认 `guest=false`、用户 ID 非空后才可加密保存；所有终止路径关闭进程/CDP并删除临时 Profile；

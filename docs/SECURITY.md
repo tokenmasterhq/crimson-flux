@@ -20,11 +20,11 @@ CrimsonFlux 是本地单用户源码预览，不是互联网服务。Web 服务�
 
 ## 隔离可见浏览器登录
 
-为避免要求普通用户打开开发者工具，原生桌面环境可以启动一次性、可见的官方网页登录窗口。它不是用户日常浏览器：应用从固定 Chrome/Edge/Chromium 路径 allowlist 选择程序，以固定参数创建权限 `0700` 的随机临时 Profile，只打开固定官方 URL；不接受自定义 executable、flags 或 URL，也不读取默认 Profile。
+为避免要求普通用户打开开发者工具，原生桌面环境可以启动一次性、可见的官方网页登录窗口。它不是用户日常浏览器：应用从固定 Chrome/Edge/Chromium 路径 allowlist 选择程序，以固定参数创建权限 `0700` 的随机临时 Profile，只打开固定官方 URL；不接受自定义 executable、flags 或 URL，也不读取默认 Profile。Windows 安装根只通过系统 `SHGetKnownFolderPath` 获取，再拼接源码固定 suffix；不接受 `PATH`、Program Files 或 Local AppData 环境变量作为可执行文件根。
 
 调试接口只绑定 `127.0.0.1` 随机端口。允许的 CDP 方法仅限 `Target.getTargets`、`Target.attachToTarget` 和 URL-scoped `Network.getCookies`；明确禁止 `Network.enable`，避免订阅不必要的网络事件与响应元数据。禁止执行页面 JavaScript、读取响应正文、DOM、截图、localStorage、浏览历史或浏览器全局 Cookie。禁止 `--no-sandbox`、`--disable-web-security` 和通配 remote origins。
 
-应用只查询固定 `/user/me` URL 可用的 Cookie，过滤为平台域，要求 `a1` 与 `web_session`，再交给既有 adapter 请求 `/user/me` 验证 `guest=false` 与非空用户 ID。验证成功前不保存凭证；成功、取消、失败、超时、窗口关闭和服务关闭都必须关闭 CDP/浏览器、清空内存引用并删除临时 Profile。
+应用只查询固定 `/user/me` URL 可用的 Cookie，过滤为平台域，要求 `a1` 与 `web_session`，再交给既有 adapter 请求 `/user/me` 验证 `guest=false` 与非空用户 ID。验证后仍须先完成浏览器进程树与临时 Profile cleanup barrier 才能保存凭证；清理失败、取消或超时都必须阻止保存。Windows 只可按本次启动的 owned PID 调用系统 `taskkill /PID ... /T /F`，禁止按进程名或外部 PID 结束用户浏览器。
 
 Docker、无 GUI 环境或未找到 allowlist 浏览器时自动登录明确不可用，用户仍可主动使用手动 Cookie 导入。不得回退到默认 Profile、任意 executable、shell、危险 flags 或更宽的调试能力。完整边界见 [G1_SECURITY.md](G1_SECURITY.md)。
 
