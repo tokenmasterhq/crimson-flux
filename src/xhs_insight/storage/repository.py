@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import threading
 import uuid
@@ -33,6 +34,36 @@ def _dump(value: Any) -> str:
 
 def _load(value: str | None, default: Any = None) -> Any:
     return default if not value else json.loads(value)
+
+
+class AccountCooldownError(ValueError):
+    """Public, credential-free rejection for account-wide request cooldowns."""
+
+    retryable = True
+
+    def __init__(self, cooldown_until: str, reason_code: str) -> None:
+        until = datetime.fromisoformat(cooldown_until)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=UTC)
+        self.retry_after = max(
+            0,
+            math.ceil((until - datetime.now(UTC)).total_seconds()),
+        )
+        self.code = (
+            AdapterErrorCode(reason_code)
+            if reason_code
+            in {
+                AdapterErrorCode.RATE_LIMITED.value,
+                AdapterErrorCode.RISK_CONTROLLED.value,
+                AdapterErrorCode.NETWORK_ERROR.value,
+            }
+            else AdapterErrorCode.RATE_LIMITED
+        )
+        self.public_message = (
+            "平台要求等待至 "
+            f"{until.isoformat(timespec='seconds')} 后再创建或继续任务。"
+        )
+        super().__init__(self.public_message)
 
 
 class Repository:
@@ -117,6 +148,10 @@ class Repository:
                     error_code TEXT,
                     error_message TEXT,
                     retry_after_at TEXT,
+                    request_budget INTEGER NOT NULL DEFAULT 100000,
+                    page_budget INTEGER NOT NULL DEFAULT 10000,
+                    retry_budget INTEGER NOT NULL DEFAULT 12,
+                    retry_attempts INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
@@ -125,6 +160,13 @@ class Repository:
 
                 CREATE INDEX IF NOT EXISTS idx_jobs_status_created
                     ON jobs(status, created_at);
+
+                CREATE TABLE IF NOT EXISTS account_cooldowns (
+                    account_fingerprint TEXT PRIMARY KEY,
+                    cooldown_until TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS job_pages (
                     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -176,7 +218,64 @@ class Repository:
                 )
             if "retry_after_at" not in columns:
                 connection.execute("ALTER TABLE jobs ADD COLUMN retry_after_at TEXT")
-            connection.execute("PRAGMA user_version=4")
+            if "request_budget" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN request_budget INTEGER NOT NULL DEFAULT 100000"
+                )
+            if "page_budget" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN page_budget INTEGER NOT NULL DEFAULT 10000"
+                )
+            if "retry_budget" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN retry_budget INTEGER NOT NULL DEFAULT 12"
+                )
+            if "retry_attempts" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN retry_attempts INTEGER NOT NULL DEFAULT 0"
+                )
+            if int(connection.execute("PRAGMA user_version").fetchone()[0]) < 6:
+                active = tuple(
+                    item.value
+                    for item in (
+                        JobStatus.QUEUED,
+                        JobStatus.ENUMERATING,
+                        JobStatus.AWAITING_DETAIL_CONFIRMATION,
+                        JobStatus.FETCHING_DETAILS,
+                        JobStatus.PAUSED_AUTH,
+                        JobStatus.PAUSED_RATE_LIMIT,
+                        JobStatus.PAUSED_INTERRUPTED,
+                        JobStatus.CANCELLED,
+                    )
+                )
+                placeholders = ",".join("?" for _ in active)
+                connection.execute(
+                    f"""UPDATE jobs SET status=?,stage=?,error_code=?,
+                         error_message='旧版本任务没有可验证的请求预算，请缩小范围后创建新任务',
+                         termination_reason='request_budget_migration'
+                       WHERE status IN ({placeholders})""",
+                    (
+                        JobStatus.PAUSED_CURSOR_INVALID.value,
+                        JobStatus.PAUSED_CURSOR_INVALID.value,
+                        AdapterErrorCode.REQUEST_BUDGET_EXHAUSTED.value,
+                        *active,
+                    ),
+                )
+                connection.execute(
+                    """UPDATE jobs SET error_code=?,
+                         error_message='旧版本任务没有可验证的请求预算，不能重试详情',
+                         termination_reason=COALESCE(termination_reason,'request_budget_migration')
+                       WHERE status IN (?,?) AND EXISTS (
+                         SELECT 1 FROM notes
+                         WHERE notes.job_id=jobs.id AND notes.detail_status='failed'
+                       )""",
+                    (
+                        AdapterErrorCode.REQUEST_BUDGET_EXHAUSTED.value,
+                        JobStatus.COMPLETED_WITH_WARNINGS.value,
+                        JobStatus.FAILED.value,
+                    ),
+                )
+            connection.execute("PRAGMA user_version=6")
 
     def set_meta(self, key: str, value: str) -> None:
         with self.transaction() as connection:
@@ -194,14 +293,42 @@ class Repository:
     def save_auth(self, payload_cipher: bytes, account_fingerprint: str) -> None:
         now = utc_now()
         with self.transaction() as connection:
-            connection.execute(
-                """INSERT INTO auth_session(id,payload_cipher,account_fingerprint,connected_at,updated_at)
-                   VALUES(1,?,?,?,?)
-                   ON CONFLICT(id) DO UPDATE SET payload_cipher=excluded.payload_cipher,
-                     account_fingerprint=excluded.account_fingerprint,
-                     connected_at=excluded.connected_at,updated_at=excluded.updated_at""",
-                (payload_cipher, account_fingerprint, now, now),
-            )
+            self._save_auth(connection, payload_cipher, account_fingerprint, now)
+
+    def save_auth_if_no_running_or_queued_jobs(
+        self,
+        payload_cipher: bytes,
+        account_fingerprint: str,
+    ) -> None:
+        """Commit verified credentials only while task admission is idle.
+
+        ``BEGIN IMMEDIATE`` serializes this check-and-write with ``create_job``
+        and ``next_runnable_job``.  Repeated read-only checks in the API remain
+        useful for early feedback, but this transaction is the authoritative
+        boundary that prevents a credential switch from crossing task admission.
+        """
+
+        now = utc_now()
+        with self.transaction() as connection:
+            if self._has_running_or_queued_jobs(connection):
+                raise PermissionError("验证期间已有任务开始运行，登录态未保存")
+            self._save_auth(connection, payload_cipher, account_fingerprint, now)
+
+    @staticmethod
+    def _save_auth(
+        connection: sqlite3.Connection,
+        payload_cipher: bytes,
+        account_fingerprint: str,
+        now: str,
+    ) -> None:
+        connection.execute(
+            """INSERT INTO auth_session(id,payload_cipher,account_fingerprint,connected_at,updated_at)
+               VALUES(1,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET payload_cipher=excluded.payload_cipher,
+                 account_fingerprint=excluded.account_fingerprint,
+                 connected_at=excluded.connected_at,updated_at=excluded.updated_at""",
+            (payload_cipher, account_fingerprint, now, now),
+        )
 
     def load_auth(self) -> dict[str, Any] | None:
         with self.connection() as connection:
@@ -243,16 +370,35 @@ class Repository:
         account_fingerprint: str | None,
         preapprove_details: bool = False,
         source_private_cipher: bytes | None = None,
+        request_budget: int = 100000,
+        page_budget: int = 10000,
+        retry_budget: int = 12,
         job_id: str | None = None,
     ) -> dict[str, Any]:
         job_id = job_id or uuid.uuid4().hex
         now = utc_now()
         with self.transaction() as connection:
+            # JobService may have read the in-memory fingerprint immediately
+            # before a verified credential commit won the SQLite writer lock.
+            # Bind the task to the authoritative credential row while holding
+            # that same lock, rather than persisting the stale caller snapshot.
+            auth_row = connection.execute(
+                "SELECT account_fingerprint FROM auth_session WHERE id=1"
+            ).fetchone()
+            if auth_row is None:
+                raise PermissionError("登录状态已失效，请重新登录后创建任务")
+            effective_fingerprint = str(auth_row["account_fingerprint"])
+            self._raise_if_account_cooling_down(
+                connection,
+                effective_fingerprint,
+                now,
+            )
             connection.execute(
                 """INSERT INTO jobs(
                      id,source_type,source_json,source_private_cipher,content_json,status,stage,cursor_json,
-                     account_fingerprint,adapter_version,preapprove_details,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     account_fingerprint,adapter_version,preapprove_details,request_budget,page_budget,
+                     retry_budget,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job_id,
                     source["type"],
@@ -262,9 +408,12 @@ class Repository:
                     JobStatus.QUEUED.value,
                     JobStatus.QUEUED.value,
                     _dump({"page": 1}) if source["type"] == "keyword" else _dump({"cursor": ""}),
-                    account_fingerprint,
+                    effective_fingerprint,
                     adapter_version,
                     int(preapprove_details),
+                    max(1, int(request_budget)),
+                    max(1, int(page_budget)),
+                    max(0, int(retry_budget)),
                     now,
                     now,
                 ),
@@ -308,7 +457,15 @@ class Repository:
         now = utc_now()
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT id FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
+                """SELECT jobs.id FROM jobs
+                   WHERE jobs.status='queued'
+                     AND (jobs.account_fingerprint IS NULL OR NOT EXISTS (
+                         SELECT 1 FROM account_cooldowns cooldown
+                         WHERE cooldown.account_fingerprint=jobs.account_fingerprint
+                           AND cooldown.cooldown_until>?
+                     ))
+                   ORDER BY jobs.created_at ASC LIMIT 1""",
+                (now,),
             ).fetchone()
             if row is None:
                 return None
@@ -335,14 +492,139 @@ class Repository:
             ).fetchone()
         return self._job(claimed_row)
 
-    def has_running_or_queued_jobs(self) -> bool:
-        statuses = (JobStatus.QUEUED.value, *(item.value for item in ACTIVE_STATUSES))
-        placeholders = ",".join("?" for _ in statuses)
+    def account_cooldown(self, account_fingerprint: str | None) -> dict[str, str] | None:
+        if not account_fingerprint:
+            return None
+        now = utc_now()
         with self.connection() as connection:
             row = connection.execute(
-                f"SELECT 1 FROM jobs WHERE status IN ({placeholders}) LIMIT 1",
-                statuses,
+                """SELECT cooldown_until,reason_code,updated_at FROM account_cooldowns
+                   WHERE account_fingerprint=? AND cooldown_until>?""",
+                (account_fingerprint, now),
             ).fetchone()
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def _raise_if_account_cooling_down(
+        connection: sqlite3.Connection,
+        account_fingerprint: str | None,
+        now: str,
+    ) -> None:
+        if not account_fingerprint:
+            return
+        cooldown = connection.execute(
+            """SELECT cooldown_until,reason_code FROM account_cooldowns
+               WHERE account_fingerprint=? AND cooldown_until>?""",
+            (account_fingerprint, now),
+        ).fetchone()
+        if cooldown is not None:
+            raise AccountCooldownError(
+                str(cooldown["cooldown_until"]),
+                str(cooldown["reason_code"]),
+            )
+
+    def set_account_cooldown(
+        self,
+        account_fingerprint: str,
+        *,
+        cooldown_until: str,
+        reason_code: str,
+    ) -> dict[str, str]:
+        """Persist a cooldown and freeze every queued job for this account.
+
+        A timestamp alone is not a sufficient pause boundary: once it expires the
+        worker would otherwise claim a sibling job without the user explicitly
+        deciding to resume.  Moving queued work to a paused state in this same
+        transaction makes the account-wide stop durable across restarts.
+        """
+
+        now = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT INTO account_cooldowns(
+                       account_fingerprint,cooldown_until,reason_code,updated_at
+                   ) VALUES(?,?,?,?)
+                   ON CONFLICT(account_fingerprint) DO UPDATE SET
+                     cooldown_until=CASE
+                       WHEN excluded.cooldown_until>account_cooldowns.cooldown_until
+                         THEN excluded.cooldown_until
+                       ELSE account_cooldowns.cooldown_until
+                     END,
+                     reason_code=CASE
+                       WHEN excluded.cooldown_until>=account_cooldowns.cooldown_until
+                         THEN excluded.reason_code
+                       ELSE account_cooldowns.reason_code
+                     END,
+                     updated_at=excluded.updated_at""",
+                (account_fingerprint, cooldown_until, reason_code, now),
+            )
+            row = connection.execute(
+                """SELECT cooldown_until,reason_code,updated_at FROM account_cooldowns
+                   WHERE account_fingerprint=?""",
+                (account_fingerprint,),
+            ).fetchone()
+            assert row is not None
+            effective_until = str(row["cooldown_until"])
+            effective_reason = str(row["reason_code"])
+            if effective_reason == AdapterErrorCode.NETWORK_ERROR.value:
+                paused_status = JobStatus.PAUSED_INTERRUPTED.value
+                public_message = (
+                    "同一账号遇到服务或网络等待要求，排队任务已一并暂停；"
+                    "等待结束后请手动继续。"
+                )
+            else:
+                paused_status = JobStatus.PAUSED_RATE_LIMIT.value
+                public_message = (
+                    "同一账号收到平台等待要求，排队任务已一并暂停；"
+                    "等待结束后请手动继续。"
+                )
+            connection.execute(
+                """UPDATE jobs SET status=?,stage=?,error_code=?,error_message=?,
+                     retry_after_at=?,
+                     termination_reason=CASE
+                       WHEN termination_reason IN (
+                         'natural_end','pagination_stalled','reached_limit',
+                         'safety_cap','source_exhausted'
+                       ) THEN termination_reason
+                       ELSE ?
+                     END,
+                     updated_at=?
+                   WHERE account_fingerprint=? AND (
+                     status=? OR (
+                       status IN (?,?) AND error_code IN (?,?,?)
+                     )
+                   )""",
+                (
+                    paused_status,
+                    paused_status,
+                    effective_reason,
+                    public_message,
+                    effective_until,
+                    effective_reason.lower(),
+                    now,
+                    account_fingerprint,
+                    JobStatus.QUEUED.value,
+                    JobStatus.PAUSED_RATE_LIMIT.value,
+                    JobStatus.PAUSED_INTERRUPTED.value,
+                    AdapterErrorCode.RATE_LIMITED.value,
+                    AdapterErrorCode.RISK_CONTROLLED.value,
+                    AdapterErrorCode.NETWORK_ERROR.value,
+                ),
+            )
+        return dict(row)
+
+    def has_running_or_queued_jobs(self) -> bool:
+        with self.connection() as connection:
+            return self._has_running_or_queued_jobs(connection)
+
+    @staticmethod
+    def _has_running_or_queued_jobs(connection: sqlite3.Connection) -> bool:
+        statuses = (JobStatus.QUEUED.value, *(item.value for item in ACTIVE_STATUSES))
+        placeholders = ",".join("?" for _ in statuses)
+        row = connection.execute(
+            f"SELECT 1 FROM jobs WHERE status IN ({placeholders}) LIMIT 1",
+            statuses,
+        ).fetchone()
         return row is not None
 
     def update_job(self, job_id: str, **changes: Any) -> dict[str, Any]:
@@ -405,6 +687,18 @@ class Repository:
         values.append(now)
         values.append(job_id)
         with self.transaction() as connection:
+            if str(getattr(status, "value", status)) == JobStatus.QUEUED.value:
+                current = connection.execute(
+                    "SELECT account_fingerprint FROM jobs WHERE id=?",
+                    (job_id,),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(job_id)
+                self._raise_if_account_cooling_down(
+                    connection,
+                    str(current["account_fingerprint"] or "") or None,
+                    now,
+                )
             cursor = connection.execute(
                 f"UPDATE jobs SET {', '.join(clauses)} WHERE id=?", values
             )
@@ -425,23 +719,55 @@ class Repository:
             if not cursor.rowcount:
                 raise KeyError(job_id)
 
+    def reserve_request(
+        self,
+        job_id: str,
+        *,
+        detail: bool,
+        retry_hint: bool,
+    ) -> str | None:
+        """Atomically admit one request or return a credential-free stop reason."""
+
+        now = utc_now()
+        with self.transaction() as connection:
+            row = connection.execute(
+                """SELECT status,cancel_requested,list_requests,detail_requests,
+                          pages_requested,detail_succeeded,detail_failed,
+                          request_budget,retry_budget,retry_attempts
+                   FROM jobs WHERE id=?""",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            if bool(row["cancel_requested"]):
+                return "cancelled"
+            if str(row["status"]) not in {
+                JobStatus.ENUMERATING.value,
+                JobStatus.FETCHING_DETAILS.value,
+            }:
+                return "not_active"
+            total = int(row["list_requests"]) + int(row["detail_requests"])
+            if total >= int(row["request_budget"]):
+                return "request_budget"
+            outstanding = (
+                int(row["detail_requests"])
+                > int(row["detail_succeeded"]) + int(row["detail_failed"])
+                if detail
+                else int(row["list_requests"]) > int(row["pages_requested"])
+            )
+            is_retry = bool(retry_hint or outstanding)
+            if is_retry and int(row["retry_attempts"]) >= int(row["retry_budget"]):
+                return "retry_budget"
+            column = "detail_requests" if detail else "list_requests"
+            connection.execute(
+                f"""UPDATE jobs SET {column}={column}+1,
+                     retry_attempts=retry_attempts+?,updated_at=? WHERE id=?""",
+                (int(is_retry), now, job_id),
+            )
+        return None
+
     def queue_job(self, job_id: str) -> dict[str, Any]:
-        current = self.require_job(job_id)
-        if (
-            current["status"] == JobStatus.PAUSED_CURSOR_INVALID.value
-            or current["error_code"] == AdapterErrorCode.RESUME_INCOMPATIBLE.value
-        ):
-            raise ValueError("任务游标已失效，不能恢复；请创建新任务")
-        if JobStatus(current["status"]) not in RESUMABLE_STATUSES:
-            raise ValueError(f"任务当前状态不可继续: {current['status']}")
-        changes: dict[str, Any] = {
-            "status": JobStatus.QUEUED,
-            "stage": JobStatus.QUEUED,
-            "cancel_requested": False,
-            "error_code": None,
-            "error_message": None,
-            "retry_after_at": None,
-        }
+        now = utc_now()
         enumeration_reasons = {
             "natural_end",
             "pagination_stalled",
@@ -449,9 +775,43 @@ class Repository:
             "safety_cap",
             "source_exhausted",
         }
-        if current["termination_reason"] not in enumeration_reasons:
-            changes["termination_reason"] = None
-        return self.update_job(job_id, **changes)
+        with self.transaction() as connection:
+            current = connection.execute(
+                """SELECT status,error_code,termination_reason,account_fingerprint
+                   FROM jobs WHERE id=?""",
+                (job_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(job_id)
+            if (
+                current["status"] == JobStatus.PAUSED_CURSOR_INVALID.value
+                or current["error_code"] == AdapterErrorCode.RESUME_INCOMPATIBLE.value
+            ):
+                raise ValueError("任务游标已失效，不能恢复；请创建新任务")
+            if JobStatus(str(current["status"])) not in RESUMABLE_STATUSES:
+                raise ValueError(f"任务当前状态不可继续: {current['status']}")
+            self._raise_if_account_cooling_down(
+                connection,
+                str(current["account_fingerprint"] or "") or None,
+                now,
+            )
+            termination_reason = current["termination_reason"]
+            if termination_reason not in enumeration_reasons:
+                termination_reason = None
+            connection.execute(
+                """UPDATE jobs SET status=?,stage=?,cancel_requested=0,
+                     error_code=NULL,error_message=NULL,retry_after_at=NULL,
+                     termination_reason=?,finished_at=NULL,updated_at=?
+                   WHERE id=?""",
+                (
+                    JobStatus.QUEUED.value,
+                    JobStatus.QUEUED.value,
+                    termination_reason,
+                    now,
+                    job_id,
+                ),
+            )
+        return self.require_job(job_id)
 
     def mark_interrupted(self) -> list[str]:
         statuses = tuple(item.value for item in ACTIVE_STATUSES)
@@ -475,16 +835,36 @@ class Repository:
     def set_content_and_queue_details(
         self, job_id: str, content: Mapping[str, Any]
     ) -> dict[str, Any]:
-        current = self.require_job(job_id)
-        if current["status"] != JobStatus.AWAITING_DETAIL_CONFIRMATION.value:
-            raise ValueError("任务不在等待详情确认状态")
-        return self.update_job(
-            job_id,
-            content=dict(content),
-            preapprove_details=True,
-            status=JobStatus.QUEUED,
-            stage=JobStatus.QUEUED,
-        )
+        now = utc_now()
+        with self.transaction() as connection:
+            current = connection.execute(
+                """SELECT status,error_code,account_fingerprint FROM jobs
+                   WHERE id=?""",
+                (job_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(job_id)
+            if current["error_code"] == AdapterErrorCode.REQUEST_BUDGET_EXHAUSTED.value:
+                raise ValueError("旧版本任务没有可验证的请求预算，不能继续详情请求")
+            if current["status"] != JobStatus.AWAITING_DETAIL_CONFIRMATION.value:
+                raise ValueError("任务不在等待详情确认状态")
+            self._raise_if_account_cooling_down(
+                connection,
+                str(current["account_fingerprint"] or "") or None,
+                now,
+            )
+            connection.execute(
+                """UPDATE jobs SET content_json=?,preapprove_details=1,
+                     status=?,stage=?,finished_at=NULL,updated_at=? WHERE id=?""",
+                (
+                    _dump(dict(content)),
+                    JobStatus.QUEUED.value,
+                    JobStatus.QUEUED.value,
+                    now,
+                    job_id,
+                ),
+            )
+        return self.require_job(job_id)
 
     @staticmethod
     def _cursor_identity(source_type: str, cursor: Mapping[str, Any]) -> dict[str, Any]:
@@ -808,19 +1188,59 @@ class Repository:
                 (utc_now(), job_id),
             )
 
-    def retry_failed_details(self, job_id: str) -> int:
+    def retry_failed_details_and_queue(self, job_id: str) -> dict[str, Any]:
         now = utc_now()
         with self.transaction() as connection:
-            cursor = connection.execute(
+            current = connection.execute(
+                """SELECT status,error_code,enumeration_complete,account_fingerprint
+                   FROM jobs WHERE id=?""",
+                (job_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(job_id)
+            if current["error_code"] == AdapterErrorCode.REQUEST_BUDGET_EXHAUSTED.value:
+                raise ValueError("任务没有剩余的安全请求预算，不能重试详情")
+            if JobStatus(str(current["status"])) not in {
+                JobStatus.COMPLETED,
+                JobStatus.COMPLETED_WITH_WARNINGS,
+                JobStatus.CANCELLED,
+                JobStatus.FAILED,
+            }:
+                raise ValueError("任务仍在运行或等待操作，当前不能重试详情")
+            if not bool(current["enumeration_complete"]):
+                raise ValueError("列表尚未完成，不能单独重试详情")
+            self._raise_if_account_cooling_down(
+                connection,
+                str(current["account_fingerprint"] or "") or None,
+                now,
+            )
+            failed_count = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM notes
+                       WHERE job_id=? AND detail_status='failed'""",
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            if failed_count == 0:
+                raise ValueError("没有可重试的详情")
+            connection.execute(
                 """UPDATE notes SET detail_status='pending',detail_error_code=NULL,updated_at=?
                    WHERE job_id=? AND detail_status='failed'""",
                 (now, job_id),
             )
             connection.execute(
-                "UPDATE jobs SET detail_failed=0,details_complete=0,updated_at=? WHERE id=?",
-                (now, job_id),
+                """UPDATE jobs SET detail_failed=0,details_complete=0,
+                     status=?,stage=?,preapprove_details=1,cancel_requested=0,
+                     error_code=NULL,error_message=NULL,retry_after_at=NULL,
+                     finished_at=NULL,updated_at=? WHERE id=?""",
+                (
+                    JobStatus.QUEUED.value,
+                    JobStatus.QUEUED.value,
+                    now,
+                    job_id,
+                ),
             )
-        return int(cursor.rowcount)
+        return self.require_job(job_id)
 
     def list_notes(self, job_id: str, *, limit: int | None = None, offset: int = 0) -> list[dict[str, Any]]:
         parameters: list[Any] = [job_id]
@@ -836,6 +1256,7 @@ class Repository:
         with self.transaction() as connection:
             connection.execute("DELETE FROM auth_session")
             connection.execute("DELETE FROM jobs")
+            connection.execute("DELETE FROM account_cooldowns")
 
     def delete_job(self, job_id: str) -> bool:
         with self.transaction() as connection:

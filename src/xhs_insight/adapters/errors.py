@@ -23,6 +23,10 @@ _DEFAULTS: dict[AdapterErrorCode, tuple[str, bool]] = {
     AdapterErrorCode.ACCOUNT_CHANGED: ("登录账号已变化，不能继续旧任务。", False),
     AdapterErrorCode.DISK_FULL: ("磁盘空间不足。", True),
     AdapterErrorCode.INTERNAL_ERROR: ("采集遇到未预期错误。", True),
+    AdapterErrorCode.REQUEST_BUDGET_EXHAUSTED: (
+        "任务已达到本地安全请求预算，已停止继续请求。",
+        False,
+    ),
 }
 
 
@@ -41,8 +45,6 @@ class AdapterError(Exception):
             self.retryable = default_retryable
         if type(self.retry_after) is not int or self.retry_after < 0:
             self.retry_after = None
-        elif self.retry_after > 3600:
-            self.retry_after = 3600
         self.detail = redact_text(self.detail, limit=500)
         super().__init__(self.message)
 

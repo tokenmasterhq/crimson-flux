@@ -1,6 +1,7 @@
 import csv
 import hashlib
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from xhs_insight.domain import ContentSelection
@@ -9,12 +10,66 @@ from xhs_insight.storage import Repository
 
 
 def _create_job(repository: Repository) -> dict:
+    if repository.load_auth() is None:
+        repository.save_auth(b"fixture-auth", "account-1")
     return repository.create_job(
         source={"type": "keyword", "keyword": "测试", "limit": 2},
         content=ContentSelection.model_validate({"preset": "full"}).model_dump(mode="json"),
         adapter_version="fixture-v1",
         account_fingerprint="account-1",
     )
+
+
+def test_v6_migration_disables_only_old_tasks_that_can_issue_requests(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy.sqlite3"
+    repository = Repository(database)
+    repository.save_auth(b"fixture-auth", "account-1")
+    resumable = repository.create_job(
+        source={"type": "keyword", "keyword": "legacy", "limit": 10},
+        content={"preset": "basic", "fields": ["author"]},
+        adapter_version="fixture-v1",
+        account_fingerprint="account-1",
+        job_id="legacy-resumable",
+    )
+    waiting = repository.create_job(
+        source={"type": "user", "profile_url": "https://example.invalid", "all": True},
+        content={"preset": "full", "fields": ["body"]},
+        adapter_version="fixture-v1",
+        account_fingerprint="account-1",
+        job_id="legacy-waiting",
+    )
+    repository.update_job(
+        waiting["id"],
+        status="awaiting_detail_confirmation",
+        stage="awaiting_detail_confirmation",
+    )
+    with repository.connection() as connection:
+        connection.execute("PRAGMA user_version=5")
+
+    migrated = Repository(database)
+
+    disabled = migrated.require_job(resumable["id"])
+    assert disabled["status"] == "paused_cursor_invalid"
+    assert disabled["error_code"] == "REQUEST_BUDGET_EXHAUSTED"
+    migrated_waiting = migrated.require_job(waiting["id"])
+    assert migrated_waiting["status"] == "paused_cursor_invalid"
+    assert migrated_waiting["error_code"] == "REQUEST_BUDGET_EXHAUSTED"
+
+
+def test_clear_all_removes_persisted_account_cooldowns(tmp_path: Path) -> None:
+    repository = Repository(tmp_path / "state.db")
+    repository.set_account_cooldown(
+        "account-1",
+        cooldown_until=(datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+        reason_code="RATE_LIMITED",
+    )
+    assert repository.account_cooldown("account-1") is not None
+
+    repository.clear_all()
+
+    assert repository.account_cooldown("account-1") is None
 
 
 def test_page_checkpoint_deduplicates_and_resumes(tmp_path: Path) -> None:
@@ -75,6 +130,7 @@ def test_user_cursor_identity_ignores_page_and_no_more_beats_safety_cap(
     tmp_path: Path,
 ) -> None:
     repository = Repository(tmp_path / "state.db")
+    repository.save_auth(b"fixture-auth", "account-1")
     source = {
         "type": "user",
         "profile_url": "https://www.xiaohongshu.com/user/profile/test-user",

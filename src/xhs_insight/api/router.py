@@ -13,7 +13,18 @@ from xhs_insight.domain import AdapterErrorCode, ConfirmDetailsRequest, CreateJo
 
 
 def _http_error(error: BaseException, *, default_status: int = 422) -> HTTPException:
-    if isinstance(error, PermissionError):
+    raw_code = getattr(getattr(error, "code", None), "value", None) or getattr(
+        error, "code", None
+    )
+    code = str(raw_code or type(error).__name__).upper()
+    if code in {
+        AdapterErrorCode.RATE_LIMITED.value,
+        AdapterErrorCode.RISK_CONTROLLED.value,
+    }:
+        status = 429
+    elif code == AdapterErrorCode.NETWORK_ERROR.value:
+        status = 503
+    elif isinstance(error, PermissionError):
         status = 409
     elif isinstance(error, KeyError):
         status = 404
@@ -21,13 +32,17 @@ def _http_error(error: BaseException, *, default_status: int = 422) -> HTTPExcep
         status = 409
     else:
         status = default_status
-    code = getattr(getattr(error, "code", None), "value", None) or getattr(error, "code", None)
     return HTTPException(
         status_code=status,
         detail={
-            "code": str(code or type(error).__name__).upper(),
+            "code": code,
             "message": str(getattr(error, "public_message", str(error))),
             "retryable": bool(getattr(error, "retryable", False)),
+            "retry_after": (
+                getattr(error, "retry_after", None)
+                if type(getattr(error, "retry_after", None)) is int
+                else None
+            ),
         },
     )
 
@@ -37,6 +52,15 @@ def _auth_import_error(error: BaseException) -> HTTPException:
         error, "code", None
     )
     code = str(raw_code or "AUTH_IMPORT_FAILED")
+    if isinstance(error, PermissionError):
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": code,
+                "message": str(getattr(error, "public_message", str(error))),
+                "retryable": False,
+            },
+        )
     statuses = {
         AdapterErrorCode.AUTH_EXPIRED.value: 401,
         AdapterErrorCode.RATE_LIMITED.value: 429,

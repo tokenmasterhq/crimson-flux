@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -61,3 +62,48 @@ def test_cli_host_override_cannot_bypass_native_loopback_gate(
 
     with pytest.raises(ValueError, match="local bind address"):
         replace(settings, host="192.0.2.10")
+
+
+def test_environment_cannot_reduce_request_pause_below_two_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CRIMSONFLUX_REQUEST_PAUSE_MIN", "1.99")
+    monkeypatch.setenv("CRIMSONFLUX_REQUEST_PAUSE_MAX", "4")
+
+    with pytest.raises(ValueError, match="at least 2 seconds"):
+        Settings.from_env()
+
+    # Direct construction remains available for deterministic offline fixtures.
+    direct = Settings(
+        host="127.0.0.1",
+        port=8765,
+        state_dir=Path("state"),
+        export_dir=Path("exports"),
+        max_keyword_items=10,
+        max_user_items=10,
+        pause_min_seconds=0,
+        pause_max_seconds=0,
+        open_browser=False,
+    )
+    assert direct.pause_min_seconds == 0
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_environment_rejects_non_finite_request_pause(
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CRIMSONFLUX_REQUEST_PAUSE_MIN", value)
+    monkeypatch.setenv("CRIMSONFLUX_REQUEST_PAUSE_MAX", "4")
+
+    with pytest.raises(ValueError, match="at least 2 seconds"):
+        Settings.from_env()
+
+
+def test_environment_caps_lifecycle_retry_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CRIMSONFLUX_MAX_JOB_RETRIES", "21")
+
+    with pytest.raises(ValueError, match="must be <= 20"):
+        Settings.from_env()

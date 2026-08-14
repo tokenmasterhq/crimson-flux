@@ -31,6 +31,7 @@ from xhs_insight.browser_login import (
     _CdpConnection,
     _cookie_header_from_cdp,
     _create_owned_profile,
+    _create_owned_profile_root,
     _create_owned_profile_root_at,
     _IsolatedBrowserSession,
     _LoginSession,
@@ -40,7 +41,12 @@ from xhs_insight.browser_login import (
     _validate_cdp_request,
     _windows_known_folder_path,
     _windows_known_folder_roots,
+    _windows_private_directory_sddl,
     _windows_taskkill_path,
+    _windows_trusted_temp_parent,
+    _windows_validate_private_directory_dacl,
+    _windows_validate_private_file_dacl,
+    _write_owned_marker,
 )
 from xhs_insight.domain import AdapterErrorCode
 
@@ -279,6 +285,11 @@ def test_source_uses_no_page_script_execution_or_default_profile() -> None:
     assert '"Network.getCookies"' in source
     assert '{"urls": [COOKIE_SOURCE_URL]}' in source
     assert "tempfile.mkdtemp" in source
+    assert "CreateDirectoryW" in source
+    assert "CreateFileW" in source
+    assert "WriteFile" in source
+    assert "FlushFileBuffers" in source
+    assert not any(value in source for value in ("USERNAME", "USERDOMAIN", "icacls"))
 
 
 def test_session_initialization_does_not_enable_network_events_and_cookie_read_still_works(
@@ -460,6 +471,10 @@ def test_windows_taskkill_timeout_has_bounded_direct_fallback(
         raise subprocess.TimeoutExpired("taskkill", 12)
 
     monkeypatch.setattr("xhs_insight.browser_login.platform.system", lambda: "Windows")
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_taskkill_path",
+        lambda: Path("C:/Windows/System32/taskkill.exe"),
+    )
     monkeypatch.setattr("xhs_insight.browser_login.subprocess.run", timeout)
 
     _terminate_browser_process(WindowsProcess())  # type: ignore[arg-type]
@@ -470,25 +485,125 @@ def test_windows_taskkill_timeout_has_bounded_direct_fallback(
 def test_windows_taskkill_path_rejects_relative_environment_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class Function:
+        argtypes: Any = None
+        restype: Any = None
+
+        @staticmethod
+        def __call__(buffer: Any, _size: int) -> int:
+            buffer.value = r"C:\Windows\System32"
+            return len(buffer.value)
+
     monkeypatch.setenv("SYSTEMROOT", "attacker-controlled-relative")
     monkeypatch.delenv("WINDIR", raising=False)
+    kernel32 = type("Kernel32", (), {"GetSystemDirectoryW": Function()})()
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_system_dll",
+        lambda _name: kernel32,
+    )
 
-    result = str(_windows_taskkill_path()).replace("/", "\\")
+    result = _windows_taskkill_path()
 
-    assert result.casefold() == "c:\\windows\\system32\\taskkill.exe"
-    assert "attacker-controlled" not in result
+    assert result is not None
+    assert str(result).replace("/", "\\").casefold() == (
+        "c:\\windows\\system32\\taskkill.exe"
+    )
+    assert "attacker-controlled" not in str(result)
 
 
 def test_windows_taskkill_path_ignores_absolute_environment_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class Function:
+        argtypes: Any = None
+        restype: Any = None
+
+        @staticmethod
+        def __call__(buffer: Any, _size: int) -> int:
+            buffer.value = r"C:\Windows\System32"
+            return len(buffer.value)
+
     monkeypatch.setenv("SYSTEMROOT", "D:\\attacker\\controlled")
     monkeypatch.setenv("WINDIR", "D:\\attacker\\controlled")
+    kernel32 = type("Kernel32", (), {"GetSystemDirectoryW": Function()})()
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_system_dll",
+        lambda _name: kernel32,
+    )
 
-    result = str(_windows_taskkill_path()).replace("/", "\\")
+    result = _windows_taskkill_path()
 
-    assert result.casefold().endswith("\\system32\\taskkill.exe")
-    assert "attacker" not in result.casefold()
+    assert result is not None
+    assert str(result).replace("/", "\\").casefold() == (
+        "c:\\windows\\system32\\taskkill.exe"
+    )
+    assert "attacker" not in str(result).casefold()
+
+
+def test_windows_taskkill_path_uses_typed_system_directory_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Function:
+        argtypes: Any = None
+        restype: Any = None
+
+        @staticmethod
+        def __call__(buffer: Any, size: int) -> int:
+            assert size == 32768
+            buffer.value = r"C:\Windows\System32"
+            return len(buffer.value)
+
+    function = Function()
+    kernel32 = type("Kernel32", (), {"GetSystemDirectoryW": function})()
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_system_dll", lambda _name: kernel32
+    )
+
+    result = _windows_taskkill_path()
+
+    assert result is not None
+    assert str(result).replace("/", "\\").casefold() == (
+        "c:\\windows\\system32\\taskkill.exe"
+    )
+    assert function.argtypes == (ctypes.POINTER(ctypes.c_wchar), ctypes.c_uint32)
+    assert function.restype is ctypes.c_uint32
+
+
+def test_windows_missing_taskkill_path_skips_helper_and_kills_owned_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[Any] = []
+
+    class WindowsProcess:
+        pid = 6161
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+        @staticmethod
+        def kill() -> None:
+            events.append("kill")
+
+        @staticmethod
+        def wait(timeout: float) -> int:
+            events.append(("wait", timeout))
+            return 0
+
+    monkeypatch.setattr("xhs_insight.browser_login.platform.system", lambda: "Windows")
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_system_dll",
+        lambda _name: (_ for _ in ()).throw(RuntimeError("system API unavailable")),
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login.subprocess.run",
+        lambda *_args, **_kwargs: pytest.fail("untrusted taskkill must not execute"),
+    )
+
+    assert _windows_taskkill_path() is None
+    _terminate_browser_process(WindowsProcess())  # type: ignore[arg-type]
+
+    assert events == ["kill", ("wait", 3)]
 
 
 def test_minimal_loopback_websocket_round_trip_uses_cdp_request_ids() -> None:
@@ -1066,6 +1181,316 @@ def test_profile_root_uses_system_temp_not_state_dir_and_preserves_host_env(
     manager.close()
     assert manager._profile_root is None
     assert not root.path.exists()
+
+
+def test_windows_trusted_temp_uses_known_folder_not_temp_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_local = tmp_path / "trusted-local-app-data"
+    trusted_temp = trusted_local / "Temp"
+    trusted_temp.mkdir(parents=True)
+    attacker = tmp_path / "attacker-temp"
+    attacker.mkdir()
+    validated: list[tuple[Path, str]] = []
+    monkeypatch.setenv("TEMP", str(attacker))
+    monkeypatch.setenv("TMP", str(attacker))
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_known_folder_path",
+        lambda _folder_id: trusted_local,
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_current_user_sid",
+        lambda: "S-1-5-21-100-200-300-400",
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_validate_temp_parent",
+        lambda path, sid: validated.append((path, sid)),
+    )
+
+    result = _windows_trusted_temp_parent()
+
+    assert result == trusted_temp
+    assert result != attacker
+    assert validated == [(trusted_temp, "S-1-5-21-100-200-300-400")]
+
+
+def test_windows_profile_root_never_calls_tempfile_selector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted_temp = tmp_path / "trusted-temp"
+    trusted_temp.mkdir()
+    sentinel = object()
+    observed: list[Path] = []
+    monkeypatch.setattr("xhs_insight.browser_login._windows_runtime", lambda: True)
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_trusted_temp_parent",
+        lambda: trusted_temp,
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login.tempfile.gettempdir",
+        lambda: pytest.fail("Windows must not consult tempfile.gettempdir"),
+    )
+
+    def create_at(parent: Path) -> object:
+        observed.append(parent)
+        return sentinel
+
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._create_owned_profile_root_at", create_at
+    )
+
+    assert _create_owned_profile_root() is sentinel
+    assert observed == [trusted_temp]
+
+
+def test_windows_private_dacl_verification_is_exact_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "S-1-5-21-100-200-300-400"
+    expected = _windows_private_directory_sddl(sid)
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_canonical_sddl",
+        lambda value, _information: value,
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_read_security_sddl",
+        lambda _path, _information: expected,
+    )
+
+    _windows_validate_private_directory_dacl(tmp_path, sid)
+
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_read_security_sddl",
+        lambda _path, _information: (
+            expected + "(A;OICI;FA;;;S-1-5-18)"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="DACL 不安全"):
+        _windows_validate_private_directory_dacl(tmp_path, sid)
+
+    file_expected = f"O:{sid}D:P(A;;FA;;;{sid})"
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_read_security_sddl",
+        lambda _path, _information: file_expected,
+    )
+    _windows_validate_private_file_dacl(tmp_path, sid)
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_read_security_sddl",
+        lambda _path, _information: file_expected + "(A;;FR;;;S-1-1-0)",
+    )
+    with pytest.raises(RuntimeError, match="标记 DACL 不安全"):
+        _windows_validate_private_file_dacl(tmp_path, sid)
+
+
+def test_windows_marker_dispatch_never_uses_environment_icacls_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / ".owner"
+    sentinel = tmp_path.lstat()
+    calls: list[tuple[Path, bytes, str]] = []
+
+    def windows_writer(path: Path, payload: bytes, sid: str) -> os.stat_result:
+        calls.append((path, payload, sid))
+        return sentinel
+
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_write_private_marker", windows_writer
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login.write_private_file",
+        lambda *_args: pytest.fail("Windows marker must not call icacls-backed writer"),
+    )
+
+    result = _write_owned_marker(
+        marker,
+        b"owned-marker",
+        "S-1-5-21-100-200-300-400",
+    )
+
+    assert result is sentinel
+    assert calls == [
+        (marker, b"owned-marker", "S-1-5-21-100-200-300-400")
+    ]
+
+
+def test_windows_root_dacl_failure_removes_exact_new_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "S-1-5-21-100-200-300-400"
+    created: list[Path] = []
+    monkeypatch.setattr("xhs_insight.browser_login._windows_runtime", lambda: True)
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_current_user_sid", lambda: sid
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_validate_temp_parent",
+        lambda path, _sid: path.lstat(),
+    )
+
+    def create_private(parent: Path, prefix: str, _owner_sid: str) -> Path:
+        path = parent / f"{prefix}{'c' * 32}"
+        path.mkdir(mode=0o700)
+        path.chmod(0o700)
+        created.append(path)
+        return path
+
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_create_private_directory",
+        create_private,
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_validate_private_directory_dacl",
+        lambda _path, _sid: (_ for _ in ()).throw(
+            RuntimeError("synthetic root DACL failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic root DACL failure"):
+        _create_owned_profile_root_at(tmp_path)
+
+    assert len(created) == 1
+    assert not created[0].exists()
+
+
+def test_windows_root_and_each_profile_apply_and_revalidate_private_dacl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "S-1-5-21-100-200-300-400"
+    created: list[tuple[Path, str, str]] = []
+    validated: list[Path] = []
+    monkeypatch.setattr("xhs_insight.browser_login._windows_runtime", lambda: True)
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_current_user_sid", lambda: sid
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_validate_temp_parent",
+        lambda path, _sid: path.lstat(),
+    )
+
+    def create_private(parent: Path, prefix: str, owner_sid: str) -> Path:
+        path = parent / f"{prefix}{'a' * 32}"
+        path.mkdir(mode=0o700)
+        path.chmod(0o700)
+        created.append((parent, prefix, owner_sid))
+        return path
+
+    def write_marker(path: Path, payload: bytes, _owner_sid: str) -> os.stat_result:
+        path.write_bytes(payload)
+        path.chmod(0o600)
+        return path.lstat()
+
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_create_private_directory",
+        create_private,
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_validate_private_directory_dacl",
+        lambda path, _sid: validated.append(path),
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_validate_private_file_dacl",
+        lambda _path, _sid: None,
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_write_private_marker", write_marker
+    )
+
+    root = _create_owned_profile_root_at(tmp_path)
+    profile = _create_owned_profile(root)
+
+    assert root.windows_owner_sid == sid
+    assert created == [
+        (tmp_path, "crimsonflux-browser-login-", sid),
+        (root.path, "profile-", sid),
+    ]
+    assert root.path in validated
+    assert profile.path in validated
+    assert validated.count(root.path) >= 2
+    assert validated.count(profile.path) >= 2
+    assert _remove_profile_root(root) is True
+
+
+def test_windows_profile_dacl_failure_leaves_no_registered_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "S-1-5-21-100-200-300-400"
+    fail_profiles = {"enabled": False}
+    monkeypatch.setattr("xhs_insight.browser_login._windows_runtime", lambda: True)
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_current_user_sid", lambda: sid
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_validate_temp_parent",
+        lambda path, _sid: path.lstat(),
+    )
+
+    def create_private(parent: Path, prefix: str, _owner_sid: str) -> Path:
+        path = parent / f"{prefix}{'b' * 32}"
+        path.mkdir(mode=0o700)
+        path.chmod(0o700)
+        return path
+
+    def verify(path: Path, _owner_sid: str) -> None:
+        if fail_profiles["enabled"] and path.name.startswith("profile-"):
+            raise RuntimeError("synthetic unsafe DACL")
+
+    def write_marker(path: Path, payload: bytes, _owner_sid: str) -> os.stat_result:
+        path.write_bytes(payload)
+        path.chmod(0o600)
+        return path.lstat()
+
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_create_private_directory",
+        create_private,
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_validate_private_directory_dacl",
+        verify,
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_validate_private_file_dacl",
+        lambda _path, _sid: None,
+    )
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._windows_write_private_marker", write_marker
+    )
+    root = _create_owned_profile_root_at(tmp_path)
+    fail_profiles["enabled"] = True
+
+    with pytest.raises(RuntimeError, match="synthetic unsafe DACL"):
+        _create_owned_profile(root)
+
+    assert root.profiles == {}
+    assert not any(item.name.startswith("profile-") for item in root.path.iterdir())
+    fail_profiles["enabled"] = False
+    assert _remove_profile_root(root) is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires real Windows security APIs")
+def test_real_windows_root_and_profile_have_exact_current_user_dacl(
+    tmp_path: Path,
+) -> None:
+    root = _create_owned_profile_root_at(tmp_path)
+    profile = _create_owned_profile(root)
+    assert root.windows_owner_sid
+
+    _windows_validate_private_directory_dacl(root.path, root.windows_owner_sid)
+    _windows_validate_private_directory_dacl(profile.path, root.windows_owner_sid)
+    _windows_validate_private_file_dacl(
+        root.path / ".crimsonflux-owner", root.windows_owner_sid
+    )
+    _windows_validate_private_file_dacl(
+        profile.marker_path, root.windows_owner_sid
+    )
+
+    assert _remove_profile_root(root) is True
 
 
 def test_owned_root_and_profile_have_direct_parent_markers(tmp_path: Path) -> None:

@@ -29,7 +29,6 @@ EXPECTED_SIGNER_VERSION = "0.2.0"
 
 _MAX_LOGIN_RESPONSE_BYTES = 256 * 1024
 _MAX_COLLECTION_RESPONSE_BYTES = 4 * 1024 * 1024
-_MAX_RETRY_AFTER_SECONDS = 60 * 60
 _MAX_COOKIE_BYTES = 16 * 1024
 _MAX_COOKIE_COUNT = 64
 _COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
@@ -104,9 +103,7 @@ class RedNoteProtocolError(RuntimeError):
         self.status_code = status_code
         self.upstream_code = upstream_code
         self.retry_after = (
-            min(retry_after, _MAX_RETRY_AFTER_SECONDS)
-            if type(retry_after) is int and retry_after >= 0
-            else None
+            retry_after if type(retry_after) is int and retry_after >= 0 else None
         )
         super().__init__(f"{operation} failed ({kind.value})")
 
@@ -414,7 +411,7 @@ def _parse_retry_after(value: Any) -> int | None:
             )
         except (OverflowError, TypeError, ValueError):
             return None
-    return min(seconds, _MAX_RETRY_AFTER_SECONDS)
+    return seconds
 
 
 def _valid_cookie_pair(name: Any, value: Any) -> bool:

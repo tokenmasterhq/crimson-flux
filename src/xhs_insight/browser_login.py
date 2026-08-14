@@ -160,12 +160,57 @@ _WINDOWS_KNOWN_FOLDER_IDS = (
     "7c5a40ef-a0fb-4bfc-874a-c0f2e0b9fa8e",
     "f1b32785-6fba-4fcf-9d55-7b8e7f157091",
 )
+_WINDOWS_LOCAL_APP_DATA_FOLDER_ID = "f1b32785-6fba-4fcf-9d55-7b8e7f157091"
 _WINDOWS_BROWSER_SUFFIXES = (
     (PureWindowsPath("Google/Chrome/Application/chrome.exe"), "Google Chrome"),
     (PureWindowsPath("Microsoft/Edge/Application/msedge.exe"), "Microsoft Edge"),
     (PureWindowsPath("Chromium/Application/chrome.exe"), "Chromium"),
 )
 _LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800
+_TOKEN_QUERY = 0x0008
+_TOKEN_USER_INFORMATION_CLASS = 1
+_OWNER_SECURITY_INFORMATION = 0x00000001
+_DACL_SECURITY_INFORMATION = 0x00000004
+_SDDL_REVISION_1 = 1
+_ERROR_ALREADY_EXISTS = 183
+_WINDOWS_SECURITY_DESCRIPTOR_MAX_BYTES = 64 * 1024
+_WINDOWS_SDDL_MAX_CHARS = 4096
+_WINDOWS_PRIVATE_DIRECTORY_ATTEMPTS = 32
+_GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
+_CREATE_NEW = 1
+_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+
+class _WindowsSidAndAttributes(ctypes.Structure):
+    _fields_ = (("sid", ctypes.c_void_p), ("attributes", ctypes.c_uint32))
+
+
+class _WindowsSecurityAttributes(ctypes.Structure):
+    _fields_ = (
+        ("length", ctypes.c_uint32),
+        ("security_descriptor", ctypes.c_void_p),
+        ("inherit_handle", ctypes.c_int),
+    )
+
+
+def _windows_runtime() -> bool:
+    return os.name == "nt"
+
+
+def _windows_system_dll(name: str) -> Any:
+    loader = getattr(ctypes, "WinDLL", None)
+    if not callable(loader):
+        raise RuntimeError("Windows 安全 API 不可用，已停止自动登录")
+    try:
+        return loader(
+            name,
+            use_last_error=True,
+            winmode=_LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise RuntimeError("Windows 安全 API 不可用，已停止自动登录") from error
 
 
 def _windows_guid(value: str) -> _WindowsGuid:
@@ -255,6 +300,448 @@ def _windows_known_folder_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
+def _windows_current_user_sid() -> str:
+    """Return the current process-token user SID without consulting environment data."""
+
+    kernel32 = _windows_system_dll("kernel32.dll")
+    advapi32 = _windows_system_dll("advapi32.dll")
+    get_current_process = kernel32.GetCurrentProcess
+    close_handle = kernel32.CloseHandle
+    local_free = kernel32.LocalFree
+    open_process_token = advapi32.OpenProcessToken
+    get_token_information = advapi32.GetTokenInformation
+    is_valid_sid = advapi32.IsValidSid
+    sid_to_string = advapi32.ConvertSidToStringSidW
+
+    get_current_process.argtypes = ()
+    get_current_process.restype = ctypes.c_void_p
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    local_free.argtypes = (ctypes.c_void_p,)
+    local_free.restype = ctypes.c_void_p
+    open_process_token.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    open_process_token.restype = ctypes.c_int
+    get_token_information.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    )
+    get_token_information.restype = ctypes.c_int
+    is_valid_sid.argtypes = (ctypes.c_void_p,)
+    is_valid_sid.restype = ctypes.c_int
+    sid_to_string.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))
+    sid_to_string.restype = ctypes.c_int
+
+    token = ctypes.c_void_p()
+    if not open_process_token(
+        get_current_process(), _TOKEN_QUERY, ctypes.byref(token)
+    ) or not token.value:
+        raise RuntimeError("无法读取当前 Windows 用户身份，已停止自动登录")
+    try:
+        required = ctypes.c_uint32()
+        get_token_information(
+            token,
+            _TOKEN_USER_INFORMATION_CLASS,
+            None,
+            0,
+            ctypes.byref(required),
+        )
+        if not 1 <= int(required.value) <= _WINDOWS_SECURITY_DESCRIPTOR_MAX_BYTES:
+            raise RuntimeError("当前 Windows 用户身份大小异常，已停止自动登录")
+        payload = ctypes.create_string_buffer(int(required.value))
+        if not get_token_information(
+            token,
+            _TOKEN_USER_INFORMATION_CLASS,
+            ctypes.cast(payload, ctypes.c_void_p),
+            required,
+            ctypes.byref(required),
+        ):
+            raise RuntimeError("无法读取当前 Windows 用户身份，已停止自动登录")
+        token_user = ctypes.cast(
+            payload, ctypes.POINTER(_WindowsSidAndAttributes)
+        ).contents
+        if not token_user.sid or not is_valid_sid(token_user.sid):
+            raise RuntimeError("当前 Windows 用户 SID 无效，已停止自动登录")
+        allocated = ctypes.c_void_p()
+        if not sid_to_string(token_user.sid, ctypes.byref(allocated)) or not allocated.value:
+            raise RuntimeError("无法规范化当前 Windows 用户 SID，已停止自动登录")
+        try:
+            sid = ctypes.wstring_at(allocated.value)
+        finally:
+            local_free(allocated)
+    finally:
+        close_handle(token)
+    if len(sid) > 184 or not re.fullmatch(r"S-\d+(?:-\d+)+", sid):
+        raise RuntimeError("当前 Windows 用户 SID 格式无效，已停止自动登录")
+    return sid
+
+
+def _windows_private_directory_sddl(user_sid: str) -> str:
+    if len(user_sid) > 184 or not re.fullmatch(r"S-\d+(?:-\d+)+", user_sid):
+        raise RuntimeError("当前 Windows 用户 SID 格式无效，已停止自动登录")
+    # Protected DACL, one inheritable full-control ACE, no SYSTEM/Admin/Everyone.
+    return f"O:{user_sid}D:P(A;OICI;FA;;;{user_sid})"
+
+
+def _windows_private_file_sddl(user_sid: str) -> str:
+    if len(user_sid) > 184 or not re.fullmatch(r"S-\d+(?:-\d+)+", user_sid):
+        raise RuntimeError("当前 Windows 用户 SID 格式无效，已停止自动登录")
+    return f"O:{user_sid}D:P(A;;FA;;;{user_sid})"
+
+
+def _windows_security_descriptor_from_sddl(sddl: str) -> ctypes.c_void_p:
+    advapi32 = _windows_system_dll("advapi32.dll")
+    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    convert.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint32),
+    )
+    convert.restype = ctypes.c_int
+    descriptor = ctypes.c_void_p()
+    descriptor_size = ctypes.c_uint32()
+    if not convert(
+        sddl,
+        _SDDL_REVISION_1,
+        ctypes.byref(descriptor),
+        ctypes.byref(descriptor_size),
+    ) or not descriptor.value:
+        raise RuntimeError("无法创建 Windows 私有目录 DACL，已停止自动登录")
+    if not 1 <= int(descriptor_size.value) <= _WINDOWS_SECURITY_DESCRIPTOR_MAX_BYTES:
+        _windows_system_dll("kernel32.dll").LocalFree(descriptor)
+        raise RuntimeError("Windows 私有目录 DACL 大小异常，已停止自动登录")
+    return descriptor
+
+
+def _windows_read_security_sddl(path: Path, security_information: int) -> str:
+    kernel32 = _windows_system_dll("kernel32.dll")
+    advapi32 = _windows_system_dll("advapi32.dll")
+    get_file_security = advapi32.GetFileSecurityW
+    convert = advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW
+    local_free = kernel32.LocalFree
+    get_file_security.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+    )
+    get_file_security.restype = ctypes.c_int
+    convert.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint32),
+    )
+    convert.restype = ctypes.c_int
+    local_free.argtypes = (ctypes.c_void_p,)
+    local_free.restype = ctypes.c_void_p
+
+    required = ctypes.c_uint32()
+    get_file_security(str(path), security_information, None, 0, ctypes.byref(required))
+    if not 1 <= int(required.value) <= _WINDOWS_SECURITY_DESCRIPTOR_MAX_BYTES:
+        raise RuntimeError("无法读取 Windows 目录 DACL，已停止自动登录")
+    descriptor = ctypes.create_string_buffer(int(required.value))
+    if not get_file_security(
+        str(path),
+        security_information,
+        ctypes.cast(descriptor, ctypes.c_void_p),
+        required,
+        ctypes.byref(required),
+    ):
+        raise RuntimeError("无法读取 Windows 目录 DACL，已停止自动登录")
+    allocated = ctypes.c_void_p()
+    characters = ctypes.c_uint32()
+    if not convert(
+        ctypes.cast(descriptor, ctypes.c_void_p),
+        _SDDL_REVISION_1,
+        security_information,
+        ctypes.byref(allocated),
+        ctypes.byref(characters),
+    ) or not allocated.value:
+        raise RuntimeError("无法验证 Windows 目录 DACL，已停止自动登录")
+    try:
+        value = ctypes.wstring_at(allocated.value)
+    finally:
+        local_free(allocated)
+    if (
+        not value
+        or len(value) > _WINDOWS_SDDL_MAX_CHARS
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise RuntimeError("Windows 目录 DACL 格式异常，已停止自动登录")
+    return value
+
+
+def _windows_canonical_sddl(sddl: str, security_information: int) -> str:
+    kernel32 = _windows_system_dll("kernel32.dll")
+    advapi32 = _windows_system_dll("advapi32.dll")
+    descriptor = _windows_security_descriptor_from_sddl(sddl)
+    convert = advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW
+    local_free = kernel32.LocalFree
+    convert.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_uint32),
+    )
+    convert.restype = ctypes.c_int
+    local_free.argtypes = (ctypes.c_void_p,)
+    local_free.restype = ctypes.c_void_p
+    allocated = ctypes.c_void_p()
+    characters = ctypes.c_uint32()
+    try:
+        if not convert(
+            descriptor,
+            _SDDL_REVISION_1,
+            security_information,
+            ctypes.byref(allocated),
+            ctypes.byref(characters),
+        ) or not allocated.value:
+            raise RuntimeError("无法规范化 Windows 目录 DACL，已停止自动登录")
+        value = ctypes.wstring_at(allocated.value)
+    finally:
+        if allocated.value:
+            local_free(allocated)
+        local_free(descriptor)
+    if not value or len(value) > _WINDOWS_SDDL_MAX_CHARS:
+        raise RuntimeError("Windows 目录 DACL 格式异常，已停止自动登录")
+    return value
+
+
+def _windows_validate_temp_parent(path: Path, user_sid: str) -> os.stat_result:
+    before = _directory_lstat(path)
+    actual = _windows_read_security_sddl(path, _OWNER_SECURITY_INFORMATION)
+    expected = _windows_canonical_sddl(
+        f"O:{user_sid}", _OWNER_SECURITY_INFORMATION
+    )
+    after = _directory_lstat(path)
+    if actual != expected or not _same_file_state(before, after):
+        raise RuntimeError("Windows 临时目录不属于当前用户，已停止自动登录")
+    return after
+
+
+def _windows_validate_private_directory_dacl(path: Path, user_sid: str) -> None:
+    security_information = _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION
+    actual = _windows_read_security_sddl(path, security_information)
+    expected = _windows_canonical_sddl(
+        _windows_private_directory_sddl(user_sid), security_information
+    )
+    if actual != expected:
+        raise RuntimeError("Windows 临时浏览器目录 DACL 不安全，已停止自动登录")
+
+
+def _windows_validate_private_file_dacl(path: Path, user_sid: str) -> None:
+    security_information = _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION
+    actual = _windows_read_security_sddl(path, security_information)
+    expected = _windows_canonical_sddl(
+        _windows_private_file_sddl(user_sid), security_information
+    )
+    if actual != expected:
+        raise RuntimeError("Windows 临时浏览器标记 DACL 不安全，已停止自动登录")
+
+
+def _windows_write_private_marker(
+    path: Path,
+    payload: bytes,
+    user_sid: str,
+) -> os.stat_result:
+    """Create and write one marker with an atomic current-user-only DACL."""
+
+    if not payload or len(payload) > _PROFILE_MARKER_MAX_BYTES:
+        raise RuntimeError("临时浏览器标记大小无效")
+    parent_identity = _directory_lstat(path.parent)
+    _windows_validate_private_directory_dacl(path.parent, user_sid)
+    kernel32 = _windows_system_dll("kernel32.dll")
+    create_file = kernel32.CreateFileW
+    write_file = kernel32.WriteFile
+    flush_file = kernel32.FlushFileBuffers
+    close_handle = kernel32.CloseHandle
+    local_free = kernel32.LocalFree
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(_WindowsSecurityAttributes),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    write_file.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.c_void_p,
+    )
+    write_file.restype = ctypes.c_int
+    flush_file.argtypes = (ctypes.c_void_p,)
+    flush_file.restype = ctypes.c_int
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    local_free.argtypes = (ctypes.c_void_p,)
+    local_free.restype = ctypes.c_void_p
+
+    descriptor = _windows_security_descriptor_from_sddl(
+        _windows_private_file_sddl(user_sid)
+    )
+    attributes = _WindowsSecurityAttributes(
+        ctypes.sizeof(_WindowsSecurityAttributes),
+        descriptor,
+        0,
+    )
+    handle: int | None = None
+    created = False
+    try:
+        raw_handle = create_file(
+            str(path),
+            _GENERIC_READ | _GENERIC_WRITE,
+            0,
+            ctypes.byref(attributes),
+            _CREATE_NEW,
+            _FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        handle_value = (
+            raw_handle.value
+            if isinstance(raw_handle, ctypes.c_void_p)
+            else raw_handle
+        )
+        handle = int(handle_value) if handle_value is not None else None
+        if handle in {None, _INVALID_HANDLE_VALUE}:
+            raise RuntimeError("无法创建 Windows 私有临时浏览器标记")
+        created = True
+        buffer = ctypes.create_string_buffer(payload)
+        written = ctypes.c_uint32()
+        if not write_file(
+            ctypes.c_void_p(handle),
+            ctypes.cast(buffer, ctypes.c_void_p),
+            len(payload),
+            ctypes.byref(written),
+            None,
+        ) or int(written.value) != len(payload):
+            raise RuntimeError("无法写入 Windows 私有临时浏览器标记")
+        if not flush_file(ctypes.c_void_p(handle)):
+            raise RuntimeError("无法同步 Windows 私有临时浏览器标记")
+    except BaseException:
+        if handle not in {None, _INVALID_HANDLE_VALUE}:
+            close_handle(ctypes.c_void_p(handle))
+            handle = None
+        if created:
+            with suppress(OSError):
+                path.unlink()
+        raise
+    finally:
+        if handle not in {None, _INVALID_HANDLE_VALUE}:
+            close_handle(ctypes.c_void_p(handle))
+        local_free(descriptor)
+
+    identity: os.stat_result | None = None
+    try:
+        identity = _regular_lstat(path)
+        _windows_validate_private_file_dacl(path, user_sid)
+        _windows_validate_private_directory_dacl(path.parent, user_sid)
+        if not os.path.samestat(_directory_lstat(path.parent), parent_identity):
+            raise RuntimeError("Windows 临时浏览器标记父目录在验证时已变化")
+        if not _same_file_state(_regular_lstat(path), identity):
+            raise RuntimeError("Windows 临时浏览器标记在验证时已被替换")
+        return identity
+    except BaseException:
+        if identity is not None:
+            with suppress(OSError):
+                current = _regular_lstat(path)
+                if _same_file_state(current, identity):
+                    path.unlink()
+        raise
+
+
+def _write_owned_marker(
+    path: Path,
+    payload: bytes,
+    windows_owner_sid: str | None,
+) -> os.stat_result:
+    if windows_owner_sid is not None:
+        return _windows_write_private_marker(path, payload, windows_owner_sid)
+    return write_private_file(path, payload)
+
+
+def _windows_create_private_directory(
+    parent: Path,
+    prefix: str,
+    user_sid: str,
+) -> Path:
+    """Atomically create a current-user-only directory with a protected DACL."""
+
+    kernel32 = _windows_system_dll("kernel32.dll")
+    create_directory = kernel32.CreateDirectoryW
+    local_free = kernel32.LocalFree
+    create_directory.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.POINTER(_WindowsSecurityAttributes),
+    )
+    create_directory.restype = ctypes.c_int
+    local_free.argtypes = (ctypes.c_void_p,)
+    local_free.restype = ctypes.c_void_p
+    descriptor = _windows_security_descriptor_from_sddl(
+        _windows_private_directory_sddl(user_sid)
+    )
+    attributes = _WindowsSecurityAttributes(
+        ctypes.sizeof(_WindowsSecurityAttributes),
+        descriptor,
+        0,
+    )
+    try:
+        for _attempt in range(_WINDOWS_PRIVATE_DIRECTORY_ATTEMPTS):
+            candidate = parent / f"{prefix}{secrets.token_hex(16)}"
+            if create_directory(str(candidate), ctypes.byref(attributes)):
+                try:
+                    _windows_validate_private_directory_dacl(candidate, user_sid)
+                except BaseException:
+                    with suppress(OSError):
+                        candidate.rmdir()
+                    raise
+                return candidate
+            get_last_error = getattr(ctypes, "get_last_error", None)
+            error_code = int(get_last_error()) if callable(get_last_error) else 0
+            if error_code != _ERROR_ALREADY_EXISTS:
+                raise RuntimeError(
+                    "无法创建 Windows 私有临时浏览器目录，已停止自动登录"
+                )
+    finally:
+        local_free(descriptor)
+    raise RuntimeError("无法分配 Windows 私有临时浏览器目录，已停止自动登录")
+
+
+def _windows_trusted_temp_parent() -> Path:
+    """Resolve `%LocalAppData%\\Temp` via Known Folder API, never environment data."""
+
+    local_app_data = _windows_known_folder_path(_WINDOWS_LOCAL_APP_DATA_FOLDER_ID)
+    if local_app_data is None:
+        raise RuntimeError("无法通过 Windows 系统 API 定位用户临时目录")
+    parent = local_app_data / "Temp"
+    if parent.parent != local_app_data or parent.name.casefold() != "temp":
+        raise RuntimeError("Windows 用户临时目录路径无效，已停止自动登录")
+    user_sid = _windows_current_user_sid()
+    _windows_validate_temp_parent(parent, user_sid)
+    return parent
+
+
+def _trusted_profile_temp_parent() -> Path:
+    if _windows_runtime():
+        return _windows_trusted_temp_parent()
+    return Path(tempfile.gettempdir())
+
+
 def _browser_candidates() -> tuple[BrowserExecutable, ...]:
     """Return only fixed vendor locations; no environment override is accepted."""
 
@@ -326,19 +813,21 @@ def _browser_creation_flags() -> int:
     return value if type(value) is int and value >= 0 else 0
 
 
-def _windows_taskkill_path() -> Path:
+def _windows_taskkill_path() -> Path | None:
     """Resolve only the operating-system taskkill binary, never PATH input."""
 
-    # Environment variables and PATH are attacker-controlled inputs here. Ask
-    # the Windows loader for its trusted system directory instead.  The fixed
-    # fallback is used only if that OS API is unavailable or returns malformed
-    # data (for example while unit tests execute on another platform).
+    # Environment variables, PATH, and guessed Windows roots are untrusted.
+    # If the system API cannot prove the directory, skip the external helper.
     try:
-        loader = getattr(ctypes, "windll", None)
-        kernel32 = getattr(loader, "kernel32", None)
+        kernel32 = _windows_system_dll("kernel32.dll")
         get_system_directory = getattr(kernel32, "GetSystemDirectoryW", None)
         if not callable(get_system_directory):
             raise AttributeError("Windows system directory API unavailable")
+        get_system_directory.argtypes = (
+            ctypes.POINTER(ctypes.c_wchar),
+            ctypes.c_uint32,
+        )
+        get_system_directory.restype = ctypes.c_uint32
         buffer = ctypes.create_unicode_buffer(32768)
         length = int(get_system_directory(buffer, len(buffer)))
         system_directory = buffer.value.rstrip("\\/")
@@ -351,9 +840,9 @@ def _windows_taskkill_path() -> Path:
             )
         ):
             return Path(system_directory + "\\taskkill.exe")
-    except (AttributeError, OSError, TypeError, ValueError):
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
         pass
-    return Path("C:\\Windows\\System32\\taskkill.exe")
+    return None
 
 
 def _terminate_browser_process(process: subprocess.Popen[bytes]) -> None:
@@ -363,15 +852,17 @@ def _terminate_browser_process(process: subprocess.Popen[bytes]) -> None:
         return
     if platform.system() == "Windows":
         pid = getattr(process, "pid", None)
+        taskkill_path = _windows_taskkill_path()
         if (
             type(pid) is int
             and 1 <= pid <= 2_147_483_647
             and process.poll() is None
+            and taskkill_path is not None
         ):
             with suppress(OSError, subprocess.TimeoutExpired):
                 subprocess.run(
                     [
-                        str(_windows_taskkill_path()),
+                        str(taskkill_path),
                         "/PID",
                         str(pid),
                         "/T",
@@ -830,6 +1321,7 @@ class _OwnedProfileRoot:
     marker_identity: os.stat_result = field(repr=False)
     temp_parent: Path
     temp_parent_identity: os.stat_result = field(repr=False)
+    windows_owner_sid: str | None = field(default=None, repr=False)
     profiles: dict[str, _OwnedProfile] = field(default_factory=dict, repr=False)
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
@@ -855,7 +1347,18 @@ def _validate_root(root: _OwnedProfileRoot) -> None:
         or not os.path.samestat(_owned_directory_lstat(root.path), root.identity)
     ):
         raise RuntimeError("临时浏览器根目录所有权校验失败")
+    if root.windows_owner_sid is not None:
+        if not _windows_runtime():
+            raise RuntimeError("临时浏览器根目录平台身份校验失败")
+        _windows_validate_temp_parent(root.temp_parent, root.windows_owner_sid)
+        _windows_validate_private_directory_dacl(
+            root.path, root.windows_owner_sid
+        )
+    elif _windows_runtime():
+        raise RuntimeError("临时浏览器根目录缺少 Windows DACL 身份")
     marker = root.path / _PROFILE_OWNER_MARKER
+    if root.windows_owner_sid is not None:
+        _windows_validate_private_file_dacl(marker, root.windows_owner_sid)
     if not os.path.samestat(_regular_lstat(marker), root.marker_identity):
         raise RuntimeError("临时浏览器根目录标记已被替换")
     if _read_owned_marker(marker, root.marker_identity) != _root_marker_payload(
@@ -882,10 +1385,18 @@ def _validate_profile(profile: _OwnedProfile, *, require_directory: bool = True)
         _owned_directory_lstat(profile.path), profile.identity
     ):
         raise RuntimeError("临时浏览器会话目录已被替换")
+    if require_directory and root.windows_owner_sid is not None:
+        _windows_validate_private_directory_dacl(
+            profile.path, root.windows_owner_sid
+        )
     if not os.path.samestat(
         _regular_lstat(profile.marker_path), profile.marker_identity
     ):
         raise RuntimeError("临时浏览器会话标记已被替换")
+    if root.windows_owner_sid is not None:
+        _windows_validate_private_file_dacl(
+            profile.marker_path, root.windows_owner_sid
+        )
     if _read_owned_marker(
         profile.marker_path, profile.marker_identity
     ) != _profile_marker_payload(root.nonce, profile.nonce):
@@ -898,14 +1409,32 @@ def _validate_profile(profile: _OwnedProfile, *, require_directory: bool = True)
 
 def _create_owned_profile_root_at(temp_parent: Path) -> _OwnedProfileRoot:
     parent = Path(os.path.abspath(temp_parent))
-    parent_identity = _directory_lstat(parent)
-    path = Path(tempfile.mkdtemp(prefix=_PROFILE_ROOT_PREFIX, dir=parent))
+    windows_owner_sid = _windows_current_user_sid() if _windows_runtime() else None
+    parent_identity = (
+        _windows_validate_temp_parent(parent, windows_owner_sid)
+        if windows_owner_sid is not None
+        else _directory_lstat(parent)
+    )
+    path = (
+        _windows_create_private_directory(
+            parent,
+            _PROFILE_ROOT_PREFIX,
+            windows_owner_sid,
+        )
+        if windows_owner_sid is not None
+        else Path(tempfile.mkdtemp(prefix=_PROFILE_ROOT_PREFIX, dir=parent))
+    )
     try:
-        os.chmod(path, 0o700)
+        if windows_owner_sid is None:
+            os.chmod(path, 0o700)
+        else:
+            _windows_validate_private_directory_dacl(path, windows_owner_sid)
         identity = _owned_directory_lstat(path)
         nonce = secrets.token_hex(32)
-        marker_identity = write_private_file(
-            path / _PROFILE_OWNER_MARKER, _root_marker_payload(nonce)
+        marker_identity = _write_owned_marker(
+            path / _PROFILE_OWNER_MARKER,
+            _root_marker_payload(nonce),
+            windows_owner_sid,
         )
         root = _OwnedProfileRoot(
             path=path,
@@ -914,6 +1443,7 @@ def _create_owned_profile_root_at(temp_parent: Path) -> _OwnedProfileRoot:
             marker_identity=marker_identity,
             temp_parent=parent,
             temp_parent_identity=parent_identity,
+            windows_owner_sid=windows_owner_sid,
         )
         _validate_root(root)
         return root
@@ -929,24 +1459,41 @@ def _create_owned_profile_root_at(temp_parent: Path) -> _OwnedProfileRoot:
 
 
 def _create_owned_profile_root() -> _OwnedProfileRoot:
-    """Create one application-owned root under Python's system temp directory."""
+    """Create one private root under an OS-trusted per-user temp location."""
 
-    return _create_owned_profile_root_at(Path(tempfile.gettempdir()))
+    return _create_owned_profile_root_at(_trusted_profile_temp_parent())
 
 
 def _create_owned_profile(root: _OwnedProfileRoot) -> _OwnedProfile:
     with root.lock:
         _validate_root(root)
-        path = Path(tempfile.mkdtemp(prefix=_PROFILE_SESSION_PREFIX, dir=root.path))
+        path = (
+            _windows_create_private_directory(
+                root.path,
+                _PROFILE_SESSION_PREFIX,
+                root.windows_owner_sid,
+            )
+            if root.windows_owner_sid is not None
+            else Path(
+                tempfile.mkdtemp(prefix=_PROFILE_SESSION_PREFIX, dir=root.path)
+            )
+        )
         try:
-            os.chmod(path, 0o700)
+            if root.windows_owner_sid is None:
+                os.chmod(path, 0o700)
+            else:
+                _windows_validate_private_directory_dacl(
+                    path, root.windows_owner_sid
+                )
             identity = _owned_directory_lstat(path)
             nonce = secrets.token_hex(32)
             marker_path = root.path / (
                 f".{path.name}{_PROFILE_SESSION_MARKER_SUFFIX}"
             )
-            marker_identity = write_private_file(
-                marker_path, _profile_marker_payload(root.nonce, nonce)
+            marker_identity = _write_owned_marker(
+                marker_path,
+                _profile_marker_payload(root.nonce, nonce),
+                root.windows_owner_sid,
             )
             profile = _OwnedProfile(
                 root=root,
@@ -960,6 +1507,7 @@ def _create_owned_profile(root: _OwnedProfileRoot) -> _OwnedProfile:
             _validate_profile(profile)
             return profile
         except BaseException:
+            root.profiles.pop(path.name, None)
             marker_path = root.path / f".{path.name}{_PROFILE_SESSION_MARKER_SUFFIX}"
             with suppress(OSError):
                 marker_path.unlink()
@@ -1022,15 +1570,19 @@ def _remove_profile_root(root: _OwnedProfileRoot | None) -> bool:
                 return True
             # A delete shim may silently no-op.  Restore the marker so the same
             # owned root can be validated and retried later.
-            root.marker_identity = write_private_file(
-                marker, _root_marker_payload(root.nonce)
+            root.marker_identity = _write_owned_marker(
+                marker,
+                _root_marker_payload(root.nonce),
+                root.windows_owner_sid,
             )
         except Exception:
             marker = root.path / _PROFILE_OWNER_MARKER
             if not _path_absent(root.path) and _path_absent(marker):
                 with suppress(Exception):
-                    root.marker_identity = write_private_file(
-                        marker, _root_marker_payload(root.nonce)
+                    root.marker_identity = _write_owned_marker(
+                        marker,
+                        _root_marker_payload(root.nonce),
+                        root.windows_owner_sid,
                     )
         return False
 

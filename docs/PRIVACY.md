@@ -15,7 +15,7 @@ CrimsonFlux 没有自建云端、模型服务、遥测或广告 SDK。真实采�
 
 原生桌面环境选择自动登录时，CrimsonFlux 会启动一个一次性、可见的官方网页登录窗口，并在操作系统临时目录下的专用私有根中创建随机临时浏览器 Profile。该目录不进入持久状态目录；应用会校验随机所有权标记、创建时文件身份、直接父目录，并拒绝 symlink、junction 或 reparse point。它不会读取或复制你的默认浏览器 Profile。Windows 浏览器安装根只由系统 Known Folder API 返回，不读取 PATH 或安装目录环境变量。应用只通过回环随机 CDP 端口读取固定 `/user/me` URL 可用的平台域 Cookie，不读取页面正文、表单、浏览历史、localStorage、响应正文或其他网站 Cookie。
 
-自动取得的 Cookie 只在内存中进入 `/user/me` 身份校验；校验成功后才加密保存。成功、取消、失败、超时、窗口关闭或服务退出时，应用会关闭 CDP 和临时浏览器，并只删除本会话重新验证归属的精确 Profile 路径。删除失败会阻止登录态保存并保留引用供重试；应用不会读取或清除宿主 safe-delete 设置，也不会用 shell、外部删除工具或扫描临时根来绕过宿主安全策略。本版本不自动回收异常断电留下的陈旧目录。Docker、无 GUI 环境或未找到固定 allowlist 浏览器时不启用自动登录。
+自动取得的 Cookie 只在内存中进入 `/user/me` 身份校验；校验成功后才加密保存。成功、取消、失败、超时、窗口关闭或服务退出时，应用会关闭 CDP 和临时浏览器，并只删除本会话重新验证归属的精确 Profile 路径。POSIX 临时目录限制为当前 UID 与 `0700`；Windows 根和每个 Profile 使用当前进程 token 用户 SID 的独占 protected DACL，创建后及删除前都会复核，不读取 `TEMP`/`TMP` 来选择根。删除失败或 DACL 无法证明会阻止登录态保存并保留引用供重试；应用不会读取或清除宿主 safe-delete 设置，也不会用 shell、外部删除工具或扫描临时根来绕过宿主安全策略。本版本不自动回收异常断电留下的陈旧目录。Docker、无 GUI 环境或未找到固定 allowlist 浏览器时不启用自动登录。
 
 Docker 将其放在命名卷 `crimsonflux_state`。原生模式默认位置：
 

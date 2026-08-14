@@ -183,8 +183,12 @@ class AuthManager:
         self._validate_payload(payload)
         fingerprint = hashlib.sha256(f"xhs-account:{account}".encode()).hexdigest()
         envelope = self.cipher.encrypt_json(payload, aad=_AUTH_AAD)
-        self.repository.save_auth(envelope, fingerprint)
         with self._lock:
+            # Keep the process-local credential cache synchronized with the
+            # authoritative SQLite commit. The repository transaction is also
+            # the task-admission barrier; no network verification happens while
+            # either this lock or the SQLite writer lock is held.
+            self.repository.save_auth_if_no_running_or_queued_jobs(envelope, fingerprint)
             self._payload = payload
             self._account_fingerprint = fingerprint
             self._load_error = None
@@ -198,8 +202,11 @@ class AuthManager:
             return copy.deepcopy(self._payload)
 
     def clear(self) -> None:
-        self.repository.delete_auth()
         with self._lock:
+            # Linearize the durable delete with the process-local cache clear.
+            # A creator that captured the old cache before this lock must still
+            # pass Repository.create_job's authoritative auth-row check.
+            self.repository.delete_auth()
             self._payload = None
             self._account_fingerprint = None
             self._load_error = None

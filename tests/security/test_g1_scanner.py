@@ -77,6 +77,19 @@ def test_canonical_browser_module_may_contain_reviewed_cdp_transport() -> None:
     assert not any("browser automation or debugging transport marker" in finding.reason for finding in findings)
 
 
+def test_canonical_browser_module_rejects_environment_selected_profile_root() -> None:
+    source = (
+        b"from pathlib import Path\nimport tempfile\n"
+        b"root = _create_owned_profile_root_at(Path(tempfile.gettempdir()))\n"
+    )
+
+    findings = _scan_payload(
+        PurePosixPath("src/xhs_insight/browser_login.py"), source
+    )
+
+    assert any("environment-selected tempfile path" in item.reason for item in findings)
+
+
 @pytest.mark.parametrize(
     "marker",
     [
@@ -294,13 +307,69 @@ def test_browser_login_g1_contract_requires_isolation_scope_verification_and_cle
     browser.write_text(
         changed(
             browser_source,
-            "_create_owned_profile_root_at(Path(tempfile.gettempdir()))",
+            "_create_owned_profile_root_at(_trusted_profile_temp_parent())",
             "_create_owned_profile_root_at(state_dir)",
         ),
         encoding="utf-8",
     )
     assert (
         _browser_login_check(tmp_path)["detail"]["system_temp_dedicated_profile_root"]
+        is False
+    )
+    browser.write_text(browser_source, encoding="utf-8")
+
+    browser.write_text(
+        changed(
+            browser_source,
+            "return _windows_trusted_temp_parent()",
+            "return Path(tempfile.gettempdir())",
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        _browser_login_check(tmp_path)["detail"]["system_temp_dedicated_profile_root"]
+        is False
+    )
+    browser.write_text(browser_source, encoding="utf-8")
+
+    browser.write_text(
+        changed(
+            browser_source,
+            "create_directory = kernel32.CreateDirectoryW",
+            "create_directory = kernel32.CreateDirectoryA",
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        _browser_login_check(tmp_path)["detail"]["windows_private_profile_dacl"]
+        is False
+    )
+    browser.write_text(browser_source, encoding="utf-8")
+
+    browser.write_text(
+        changed(
+            browser_source,
+            "create_file = kernel32.CreateFileW",
+            "create_file = lambda *_args: write_private_file(*_args)",
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        _browser_login_check(tmp_path)["detail"]["windows_private_profile_dacl"]
+        is False
+    )
+    browser.write_text(browser_source, encoding="utf-8")
+
+    browser.write_text(
+        changed(
+            browser_source,
+            "    return None\n\n\ndef _terminate_browser_process",
+            '    return Path("C:/Windows/System32/taskkill.exe")\n\n\ndef _terminate_browser_process',
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        _browser_login_check(tmp_path)["detail"]["windows_owned_process_tree_only"]
         is False
     )
     browser.write_text(browser_source, encoding="utf-8")

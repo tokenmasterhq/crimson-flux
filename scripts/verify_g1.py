@@ -17,8 +17,8 @@ from typing import Any
 from scan_release import scan_g1_tree, scan_git_history, scan_source, source_file_paths
 
 ROOT = Path(__file__).resolve().parents[1]
-POLICY_VERSION = "crimsonflux-g1-v10-owned-system-temp-profile"
-EVIDENCE_SCHEMA = "https://crimsonflux.local/schemas/g1-evidence-v10.json"
+POLICY_VERSION = "crimsonflux-g1-v11-windows-private-profile-dacl"
+EVIDENCE_SCHEMA = "https://crimsonflux.local/schemas/g1-evidence-v11.json"
 
 
 def _digest(payload: bytes) -> str:
@@ -169,13 +169,46 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
             b"_PROFILE_ROOT_PREFIX" in browser
             and b"_PROFILE_SESSION_PREFIX" in browser
             and b"def _create_owned_profile_root(" in browser
-            and b"_create_owned_profile_root_at(Path(tempfile.gettempdir()))" in browser
+            and b"def _trusted_profile_temp_parent(" in browser
+            and b"def _windows_trusted_temp_parent(" in browser
+            and b"_WINDOWS_LOCAL_APP_DATA_FOLDER_ID" in browser
+            and b'local_app_data / "Temp"' in browser
+            and b"return _windows_trusted_temp_parent()" in browser
+            and b"_create_owned_profile_root_at(_trusted_profile_temp_parent())" in browser
+            and b"_create_owned_profile_root_at(Path(tempfile.gettempdir()))" not in browser
             and b"def _create_owned_profile(" in browser
             and b"--user-data-dir=" in browser
             and b"del state_dir" in browser
             and b"dir=state_dir" not in browser
             and b"dir=self._state_dir" not in browser
             and b"tempfile.tempdir =" not in browser
+        ),
+        "windows_private_profile_dacl": (
+            b"def _windows_current_user_sid(" in browser
+            and b"OpenProcessToken" in browser
+            and b"GetTokenInformation" in browser
+            and b"ConvertSidToStringSidW" in browser
+            and b"def _windows_private_directory_sddl(" in browser
+            and b"D:P(A;OICI;FA;;;" in browser
+            and b"ConvertStringSecurityDescriptorToSecurityDescriptorW" in browser
+            and b"CreateDirectoryW" in browser
+            and b"class _WindowsSecurityAttributes" in browser
+            and b"CreateFileW" in browser
+            and b"WriteFile" in browser
+            and b"FlushFileBuffers" in browser
+            and b"GetFileSecurityW" in browser
+            and b"ConvertSecurityDescriptorToStringSecurityDescriptorW" in browser
+            and b"def _windows_validate_private_directory_dacl(" in browser
+            and b"def _windows_validate_private_file_dacl(" in browser
+            and b"def _windows_write_private_marker(" in browser
+            and b"windows_owner_sid" in browser
+            and browser.count(b"_windows_validate_private_directory_dacl(") >= 5
+            and browser.count(b"_windows_validate_private_file_dacl(") >= 4
+            and all(
+                marker not in browser
+                for marker in (b"USERNAME", b"USERDOMAIN", b"icacls")
+            )
+            and b"if windows_owner_sid is None:\n            os.chmod(path, 0o700)" in browser
         ),
         "profile_owner_and_link_validation": (
             b"_PROFILE_OWNER_MARKER" in browser
@@ -288,7 +321,13 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
             and b"with current.commit_lock:" in browser
         ),
         "windows_owned_process_tree_only": (
-            b"taskkill.exe" in browser
+            b"def _windows_taskkill_path() -> Path | None:" in browser
+            and b"GetSystemDirectoryW" in browser
+            and b"get_system_directory.argtypes" in browser
+            and b"get_system_directory.restype" in browser
+            and b"except (AttributeError, OSError, RuntimeError, TypeError, ValueError)" in browser
+            and b"taskkill.exe" in browser
+            and b"taskkill_path is not None" in browser
             and b'"/PID"' in browser
             and b'"/T"' in browser
             and b'"/F"' in browser
@@ -296,6 +335,8 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
             and b'pid = getattr(process, "pid", None)' in browser
             and b"type(pid) is int" in browser
             and b"timeout=_WINDOWS_TREE_KILL_TIMEOUT_SECONDS" in browser
+            and b"C:/Windows/System32/taskkill.exe" not in browser
+            and b"C:\\Windows\\System32\\taskkill.exe" not in browser
         ),
         "terminal_cleanup": (
             b"terminate(" in browser

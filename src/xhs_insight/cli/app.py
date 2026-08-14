@@ -8,6 +8,7 @@ import os
 import stat
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -36,6 +37,7 @@ DEFAULT_LIMIT = 50
 DEFAULT_MAX_KEYWORD_ITEMS = 1000
 DEFAULT_PAUSE_MIN_SECONDS = 2.0
 DEFAULT_PAUSE_MAX_SECONDS = 4.0
+MAX_SAFE_DEADLINE = datetime(9998, 12, 31, 23, 59, 59, tzinfo=UTC)
 SENSITIVE_QUERY_EXACT = frozenset(
     {
         "a1",
@@ -74,12 +76,33 @@ STATUS_LABELS = {
     "completed": "已完成",
     "completed_with_warnings": "完成（有缺失）",
     "paused_auth": "登录失效，已暂停",
-    "paused_rate_limit": "限流，已暂停",
+    "paused_rate_limit": "平台要求等待，已暂停",
     "paused_interrupted": "服务中断，已暂停",
     "paused_cursor_invalid": "翻页位置失效，请新建任务",
     "cancelled": "已取消",
     "failed": "失败",
 }
+WATCH_STOP_STATUSES = frozenset(
+    {
+        "paused_auth",
+        "paused_rate_limit",
+        "paused_interrupted",
+        "paused_cursor_invalid",
+        "completed",
+        "completed_with_warnings",
+        "cancelled",
+        "failed",
+    }
+)
+
+
+def _bounded_deadline(base: datetime, seconds: float) -> datetime:
+    try:
+        deadline = base + timedelta(seconds=seconds)
+    except OverflowError:
+        return MAX_SAFE_DEADLINE
+    normalized = deadline.replace(tzinfo=UTC) if deadline.tzinfo is None else deadline.astimezone(UTC)
+    return min(normalized, MAX_SAFE_DEADLINE)
 
 app = typer.Typer(
     name="crimsonflux",
@@ -113,8 +136,44 @@ def _fail(error: Exception | str, *, code: int = 1) -> NoReturn:
             )
         elif error.code == "AUTH_EXPIRED":
             message = "登录已失效，请运行 `crimsonflux login` 后恢复任务。"
-        elif error.code == "RATE_LIMITED":
-            message = "平台暂时限制请求，任务已安全暂停，请稍后恢复。"
+        elif error.code in {"RATE_LIMITED", "RISK_CONTROLLED", "NETWORK_ERROR"}:
+            retry_at: datetime | None = None
+            if error.retry_after_at:
+                try:
+                    retry_at = datetime.fromisoformat(
+                        error.retry_after_at.replace("Z", "+00:00")
+                    )
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=UTC)
+                except ValueError:
+                    retry_at = None
+            if retry_at is None and error.retry_after is not None:
+                retry_at = _bounded_deadline(datetime.now(UTC), error.retry_after)
+            if retry_at and retry_at > datetime.now(UTC):
+                remaining = max(
+                    1, math.ceil((retry_at - datetime.now(UTC)).total_seconds())
+                )
+                local_retry = retry_at.astimezone()
+                local_now = datetime.now().astimezone()
+                label = local_retry.strftime(
+                    "%H:%M:%S"
+                    if local_retry.date() == local_now.date()
+                    else "%Y-%m-%d %H:%M:%S"
+                )
+                reason = (
+                    "服务或网络暂时不可用"
+                    if error.code == "NETWORK_ERROR"
+                    else "平台要求暂时等待"
+                )
+                message = f"{reason}；请在本地时间 {label} 后重试（约 {remaining} 秒）。"
+            else:
+                message = message or (
+                    "服务或网络暂时不可用，请稍后重试。"
+                    if error.code == "NETWORK_ERROR"
+                    else "平台暂时限制请求，任务已安全暂停，请稍后恢复。"
+                )
+        elif error.code == "REQUEST_BUDGET_EXHAUSTED":
+            message = "已达到本地安全请求上限。请下载已有结果，并缩小范围后创建新任务。"
         prefix = f"[{error.code}] " if error.code else ""
         message = prefix + message
     typer.secho(f"错误：{message}", fg=typer.colors.RED, err=True)
@@ -239,6 +298,81 @@ def _print_jobs(items: list[dict[str, Any]]) -> None:
         typer.echo(f"{job_id:<10}  {status_label:<18}  {unique:>6}  {details:>11}  {source}")
 
 
+def _job_resume_at(job: dict[str, Any]) -> datetime | None:
+    deadlines: list[datetime] = []
+    for raw in (
+        job.get("resume_not_before"),
+        job.get("retry_after_at"),
+        job.get("account_cooldown_until"),
+    ):
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+            deadlines.append(min(parsed, MAX_SAFE_DEADLINE))
+        except ValueError:
+            pass
+    retry_after_raw = job.get("retry_after")
+    try:
+        seconds = float(str(retry_after_raw)) if retry_after_raw is not None else 0.0
+        updated = datetime.fromisoformat(str(job.get("updated_at") or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        pass
+    else:
+        if seconds > 0:
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=UTC)
+            deadlines.append(_bounded_deadline(updated, seconds))
+    return max(deadlines) if deadlines else None
+
+
+def _job_next_step(job: dict[str, Any]) -> str | None:
+    status = str(job.get("status") or "")
+    job_id = str(job.get("id") or "JOB_ID")
+    if job.get("error_code") == "REQUEST_BUDGET_EXHAUSTED":
+        return "已达到本地安全请求上限。请下载已有结果，并缩小范围后创建新任务。"
+    if status == "paused_auth":
+        if job.get("error_code") == "ACCOUNT_CHANGED":
+            return f"切换回创建任务时的账号，再运行 `crimsonflux jobs resume {job_id}`。"
+        return f"运行 `crimsonflux login` 重新登录，再运行 `crimsonflux jobs resume {job_id}`。"
+    if status == "paused_rate_limit":
+        resume_at = _job_resume_at(job)
+        now = datetime.now(UTC)
+        if resume_at and resume_at > now:
+            seconds = max(1, math.ceil((resume_at - now).total_seconds()))
+            minutes, remainder = divmod(seconds, 60)
+            remaining = f"{minutes} 分 {remainder} 秒" if minutes else f"{remainder} 秒"
+            local_resume = resume_at.astimezone()
+            local_now = now.astimezone()
+            local_time = local_resume.strftime(
+                "%H:%M:%S"
+                if local_resume.date() == local_now.date()
+                else "%Y-%m-%d %H:%M:%S"
+            )
+            return f"请等待到本地时间 {local_time}（还需约 {remaining}），再运行 `crimsonflux jobs resume {job_id}`。"
+        return f"现在可以运行 `crimsonflux jobs resume {job_id}` 尝试继续；若仍受限，请停止重试并继续等待。"
+    if status == "paused_interrupted":
+        resume_at = _job_resume_at(job)
+        now = datetime.now(UTC)
+        if resume_at and resume_at > now:
+            seconds = max(1, math.ceil((resume_at - now).total_seconds()))
+            minutes, remainder = divmod(seconds, 60)
+            remaining = f"{minutes} 分 {remainder} 秒" if minutes else f"{remainder} 秒"
+            local_resume = resume_at.astimezone()
+            local_now = now.astimezone()
+            local_time = local_resume.strftime(
+                "%H:%M:%S"
+                if local_resume.date() == local_now.date()
+                else "%Y-%m-%d %H:%M:%S"
+            )
+            return f"请等待到本地时间 {local_time}（还需约 {remaining}），再运行 `crimsonflux jobs resume {job_id}`。"
+        return f"进度已保存。确认服务和网络正常后，运行 `crimsonflux jobs resume {job_id}`。"
+    if status == "paused_cursor_invalid":
+        return "下一页位置已经失效，旧任务不能安全继续。请下载已有结果，并按原设置创建新任务。"
+    return None
+
+
 def _print_job(job: dict[str, Any]) -> None:
     source = _as_dict(job.get("source"))
     content = _as_dict(job.get("content"))
@@ -271,7 +405,10 @@ def _print_job(job: dict[str, Any]) -> None:
         typer.echo("范围：运行时登录账号当前可见的全部公开笔记，不含私密/删除/未返回内容")
     if job.get("termination_reason"):
         typer.echo(f"结束原因：{job['termination_reason']}")
-    if job.get("error_code") or job.get("error_message"):
+    next_step = _job_next_step(job)
+    if next_step:
+        typer.secho(f"下一步：{next_step}", fg=typer.colors.YELLOW)
+    elif job.get("error_code") or job.get("error_message"):
         typer.secho(
             f"错误：{job.get('error_code') or '-'} {job.get('error_message') or ''}".rstrip(),
             fg=typer.colors.RED,
@@ -699,6 +836,11 @@ def _legacy_jobs(
             if actions:
                 job = _unwrap_job(client.get(f"/jobs/{job_id}"))
                 action = actions[0]
+                if (
+                    job.get("error_code") == "REQUEST_BUDGET_EXHAUSTED"
+                    and action in {"resume", "retry"}
+                ):
+                    _fail("已达到本地安全请求上限，不能继续或重试。请下载已有结果，并缩小范围后创建新任务。")
                 question = ""
                 if action == "confirm-details":
                     count = int(job.get("unique_notes") or 0)
@@ -725,8 +867,10 @@ def _legacy_jobs(
                 if not yes:
                     if action == "cancel":
                         question = "确定取消任务？已采集的数据不会被删除。"
-                    elif action != "confirm-details":
-                        question = f"确定对任务执行 {action}？"
+                    elif action == "resume":
+                        question = "确定继续这个任务？"
+                    elif action == "retry":
+                        question = "确定重试没有读取成功的内容？"
                     if not typer.confirm(question):
                         raise typer.Abort()
                 if action == "confirm-details":
@@ -746,13 +890,18 @@ def _legacy_jobs(
 
             while True:
                 payload = client.get(f"/jobs/{job_id}" if job_id else f"/jobs?limit={limit}")
+                shown_job: dict[str, Any] | None = None
                 if json_output:
                     typer.echo(_json(payload))
                 elif job_id:
-                    _print_job(_unwrap_job(payload))
+                    shown_job = _unwrap_job(payload)
+                    _print_job(shown_job)
                 else:
                     _print_jobs(_jobs(payload))
                 if not watch:
+                    return
+                if shown_job and str(shown_job.get("status")) in WATCH_STOP_STATUSES:
+                    typer.echo("\n任务当前不再自动变化，已停止刷新。")
                     return
                 typer.echo(f"\n刷新时间：{time.strftime('%H:%M:%S')}（Ctrl-C 退出）\n")
                 time.sleep(2.5)

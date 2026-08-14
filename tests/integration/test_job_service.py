@@ -1,5 +1,8 @@
 import json
+import threading
 import time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -73,6 +76,8 @@ def _service(tmp_path: Path, adapter=None) -> JobService:
     )
     settings.prepare()
     repository = Repository(settings.state_dir / "xhs-insight.sqlite3")
+    if repository.load_auth() is None:
+        repository.save_auth(b"fixture-auth", "account-1")
     cipher = CredentialCipher(settings.state_dir / ".session.key")
     adapter = adapter or FakeAdapter()
     return JobService(
@@ -655,5 +660,770 @@ def test_failed_detail_can_be_retried_without_reenumeration(tmp_path: Path) -> N
         assert done["detail_succeeded"] == 1
         assert done["detail_failed"] == 0
         assert adapter.keyword_calls == 1
+    finally:
+        service.stop()
+
+
+def _install_cooldown(service: JobService) -> None:
+    service.repository.set_account_cooldown(
+        "account-1",
+        cooldown_until=(datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
+        reason_code=AdapterErrorCode.RATE_LIMITED.value,
+    )
+
+
+def _expire_cooldown(service: JobService) -> None:
+    with service.repository.transaction() as connection:
+        connection.execute(
+            "UPDATE account_cooldowns SET cooldown_until=? WHERE account_fingerprint=?",
+            (
+                (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+                "account-1",
+            ),
+        )
+    service._wake.set()
+
+
+def test_confirm_details_rejects_cooldown_without_mutation_or_automatic_expiry_run(
+    tmp_path: Path,
+) -> None:
+    class CountingAdapter(FakeAdapter):
+        user_calls = 0
+        detail_calls = 0
+
+        def user_page(self, profile_url, cursor):
+            self.user_calls += 1
+            return super().user_page(profile_url, cursor)
+
+        def note_detail(self, note_id, private):
+            self.detail_calls += 1
+            return super().note_detail(note_id, private)
+
+    adapter = CountingAdapter()
+    service = _service(tmp_path, adapter)
+    service.start()
+    try:
+        job = service.create(
+            CreateJobRequest.model_validate(
+                {
+                    "source": {
+                        "type": "user",
+                        "profile_url": "https://www.xiaohongshu.com/user/profile/cooldown-confirm",
+                        "all": True,
+                    },
+                    "content": {"preset": "full"},
+                }
+            )
+        )
+        waiting = _wait(service, job["id"], {"awaiting_detail_confirmation"})
+        before = service.repository.require_job(job["id"])
+        assert adapter.user_calls == 1
+        assert adapter.detail_calls == 0
+        _install_cooldown(service)
+
+        confirmation = ConfirmDetailsRequest.model_validate(
+            {"content": {"preset": "full"}}
+        )
+        with pytest.raises(ValueError, match="平台要求等待"):
+            service.confirm_details(job["id"], confirmation)
+
+        rejected = service.repository.require_job(job["id"])
+        assert rejected["status"] == waiting["status"]
+        assert rejected["content"] == before["content"]
+        assert rejected["preapprove_details"] == before["preapprove_details"]
+        _expire_cooldown(service)
+        time.sleep(0.1)
+        assert service.get(job["id"])["status"] == "awaiting_detail_confirmation"
+        assert adapter.detail_calls == 0
+
+        service.confirm_details(job["id"], confirmation)
+        done = _wait(service, job["id"], {"completed"})
+        assert done["detail_succeeded"] == 2
+        assert adapter.detail_calls == 2
+    finally:
+        service.stop()
+
+
+def test_retry_details_rejects_cooldown_without_partial_reset_or_automatic_run(
+    tmp_path: Path,
+) -> None:
+    class RecoveringAdapter(FakeAdapter):
+        fail_details = True
+        keyword_calls = 0
+        detail_calls = 0
+
+        def keyword_page(self, keyword, cursor):
+            self.keyword_calls += 1
+            return PageResult(
+                items=[{"note_id": "retry-note", "source_page": 1, "title": keyword}],
+                next_cursor=None,
+                has_more=False,
+                raw_item_count=1,
+            )
+
+        def note_detail(self, note_id, private):
+            self.detail_calls += 1
+            if self.fail_details:
+                raise RuntimeError("synthetic detail failure")
+            return super().note_detail(note_id, private)
+
+    adapter = RecoveringAdapter()
+    service = _service(tmp_path, adapter)
+    service.start()
+    try:
+        job = service.create(
+            CreateJobRequest.model_validate(
+                {
+                    "source": {"type": "keyword", "keyword": "冷却重试", "limit": 1},
+                    "content": {"preset": "full"},
+                }
+            )
+        )
+        warning = _wait(service, job["id"], {"completed_with_warnings"})
+        assert warning["detail_failed"] == 1
+        assert adapter.keyword_calls == 1
+        assert adapter.detail_calls == 1
+        _install_cooldown(service)
+
+        with pytest.raises(ValueError, match="平台要求等待"):
+            service.retry_details(job["id"])
+
+        rejected = service.repository.require_job(job["id"])
+        assert rejected["status"] == "completed_with_warnings"
+        assert rejected["detail_failed"] == 1
+        assert service.repository.list_notes(job["id"])[0]["detail_status"] == "failed"
+        adapter.fail_details = False
+        _expire_cooldown(service)
+        time.sleep(0.1)
+        assert service.get(job["id"])["status"] == "completed_with_warnings"
+        assert adapter.detail_calls == 1
+
+        service.retry_details(job["id"])
+        done = _wait(service, job["id"], {"completed"})
+        assert done["detail_failed"] == 0
+        assert done["detail_succeeded"] == 1
+        assert adapter.keyword_calls == 1
+        assert adapter.detail_calls == 2
+    finally:
+        service.stop()
+
+
+def test_resume_rechecks_raced_cooldown_atomically_and_requires_explicit_action(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CountingAdapter(FakeAdapter):
+        calls = 0
+
+        def keyword_page(self, keyword, cursor):
+            self.calls += 1
+            return super().keyword_page(keyword, cursor)
+
+    adapter = CountingAdapter()
+    service = _service(tmp_path, adapter)
+    job = service.create(
+        CreateJobRequest.model_validate(
+            {
+                "source": {"type": "keyword", "keyword": "冷却恢复", "limit": 1},
+                "content": {"preset": "basic"},
+            }
+        )
+    )
+    service.repository.update_job(
+        job["id"],
+        status=JobStatus.PAUSED_INTERRUPTED,
+        stage=JobStatus.PAUSED_INTERRUPTED,
+        termination_reason="process_interrupted",
+    )
+    original_queue = service.repository.queue_job
+    reached_queue = threading.Barrier(2)
+    release_queue = threading.Event()
+
+    def delayed_queue(job_id: str) -> dict:
+        reached_queue.wait(timeout=5)
+        assert release_queue.wait(timeout=5)
+        return original_queue(job_id)
+
+    monkeypatch.setattr(service.repository, "queue_job", delayed_queue)
+    errors: list[BaseException] = []
+
+    def resume_before_cooldown_commit() -> None:
+        try:
+            service.resume(job["id"])
+        except BaseException as error:
+            errors.append(error)
+
+    resume_thread = threading.Thread(target=resume_before_cooldown_commit)
+    resume_thread.start()
+    reached_queue.wait(timeout=5)
+    _install_cooldown(service)
+    release_queue.set()
+    resume_thread.join(timeout=5)
+
+    assert not resume_thread.is_alive()
+    assert len(errors) == 1
+    assert "平台要求等待" in str(errors[0])
+    assert service.repository.require_job(job["id"])["status"] == "paused_interrupted"
+    monkeypatch.setattr(service.repository, "queue_job", original_queue)
+
+    service.start()
+    try:
+        _expire_cooldown(service)
+        time.sleep(0.1)
+        assert service.get(job["id"])["status"] == "paused_interrupted"
+        assert adapter.calls == 0
+
+        service.resume(job["id"])
+        _wait(service, job["id"], {"completed"})
+        assert adapter.calls == 1
+    finally:
+        service.stop()
+
+
+def test_account_cooldown_freezes_queue_rejects_create_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    class LimitedOnceAdapter(FakeAdapter):
+        calls = 0
+
+        def keyword_page(self, keyword, cursor):
+            self.calls += 1
+            if self.calls == 1:
+                raise AdapterError(AdapterErrorCode.RATE_LIMITED, retry_after=120)
+            return super().keyword_page(keyword, cursor)
+
+    adapter = LimitedOnceAdapter()
+    service = _service(tmp_path, adapter)
+    payload = CreateJobRequest.model_validate(
+        {
+            "source": {"type": "keyword", "keyword": "露营", "limit": 1},
+            "content": {"preset": "basic"},
+        }
+    )
+    first = service.create(payload)
+    second = service.create(payload)
+    service.start()
+    try:
+        paused = _wait(service, first["id"], {"paused_rate_limit"})
+        assert paused["account_cooldown_reason"] == "RATE_LIMITED"
+        assert paused["account_cooldown_until"]
+        time.sleep(0.1)
+        frozen = service.get(second["id"])
+        assert frozen["status"] == "paused_rate_limit"
+        assert frozen["error_code"] == "RATE_LIMITED"
+        assert frozen["retry_after_at"] == paused["account_cooldown_until"]
+        assert adapter.calls == 1
+        before = len(service.list())
+        with pytest.raises(ValueError, match="平台要求等待") as captured:
+            service.create(payload)
+        assert getattr(captured.value, "code", None) == AdapterErrorCode.RATE_LIMITED
+        assert len(service.list()) == before
+    finally:
+        service.stop()
+
+    restarted = _service(tmp_path, adapter)
+    restarted.start()
+    try:
+        time.sleep(0.1)
+        assert restarted.get(second["id"])["status"] == "paused_rate_limit"
+        assert adapter.calls == 1
+        expired_at = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+        with restarted.repository.transaction() as connection:
+            connection.execute(
+                "UPDATE account_cooldowns SET cooldown_until=? WHERE account_fingerprint=?",
+                (expired_at, "account-1"),
+            )
+            connection.execute(
+                "UPDATE jobs SET retry_after_at=? WHERE id IN (?,?)",
+                (expired_at, first["id"], second["id"]),
+            )
+        time.sleep(0.6)
+        assert restarted.get(second["id"])["status"] == "paused_rate_limit"
+        assert adapter.calls == 1
+
+        resumed = restarted.resume(second["id"])
+        assert resumed["status"] == "queued"
+        _wait(restarted, second["id"], {"completed"})
+        assert adapter.calls == 2
+    finally:
+        restarted.stop()
+
+
+def test_risk_controlled_freezes_account_for_30_minutes_across_restart(
+    tmp_path: Path,
+) -> None:
+    class RiskControlledAdapter(FakeAdapter):
+        calls = 0
+
+        def keyword_page(self, keyword, cursor):
+            del keyword, cursor
+            self.calls += 1
+            raise AdapterError(AdapterErrorCode.RISK_CONTROLLED)
+
+    adapter = RiskControlledAdapter()
+    service = _service(tmp_path, adapter)
+    payload = CreateJobRequest.model_validate(
+        {
+            "source": {"type": "keyword", "keyword": "露营", "limit": 1},
+            "content": {"preset": "basic"},
+        }
+    )
+    first = service.create(payload)
+    second = service.create(payload)
+    service.start()
+    try:
+        paused = _wait(service, first["id"], {"paused_rate_limit"})
+        deadline = datetime.fromisoformat(paused["account_cooldown_until"])
+        remaining = (deadline - datetime.now(UTC)).total_seconds()
+        assert 30 * 60 - 2 <= remaining <= 30 * 60 + 1
+        assert paused["account_cooldown_reason"] == "RISK_CONTROLLED"
+        time.sleep(0.1)
+        assert service.get(second["id"])["status"] == "paused_rate_limit"
+        assert adapter.calls == 1
+        with pytest.raises(ValueError, match="平台要求等待"):
+            service.resume(first["id"])
+        with pytest.raises(ValueError, match="平台要求等待"):
+            service.create(payload)
+    finally:
+        service.stop()
+
+    restarted = _service(tmp_path, adapter)
+    restarted.start()
+    try:
+        time.sleep(0.1)
+        assert restarted.get(second["id"])["status"] == "paused_rate_limit"
+        assert restarted.get(first["id"])["account_cooldown_until"]
+        assert adapter.calls == 1
+    finally:
+        restarted.stop()
+
+
+def test_first_stage_and_cross_job_requests_share_one_global_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service(tmp_path)
+    clock = {"now": 0.0}
+
+    class FakeStop:
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, seconds: float) -> bool:
+            clock["now"] += seconds
+            return False
+
+    service._stop = FakeStop()  # type: ignore[assignment]
+    service._next_request_at = 5.0
+    monkeypatch.setattr(
+        "xhs_insight.jobs.service.time.monotonic", lambda: clock["now"]
+    )
+    monkeypatch.setattr("xhs_insight.jobs.service.random.uniform", lambda *_args: 5.0)
+    first = service.repository.create_job(
+        source={"type": "keyword", "keyword": "first", "limit": 1},
+        content={"preset": "full", "fields": ["author", "body"]},
+        adapter_version=service.adapter_version,
+        account_fingerprint="account-1",
+    )
+    second = service.repository.create_job(
+        source={"type": "keyword", "keyword": "second", "limit": 1},
+        content={"preset": "basic", "fields": ["author"]},
+        adapter_version=service.adapter_version,
+        account_fingerprint="account-1",
+    )
+    service.repository.update_job(
+        first["id"], status="enumerating", stage="enumerating"
+    )
+    observed: list[float] = []
+
+    service._upstream_call(
+        first["id"], lambda: observed.append(clock["now"]), detail=False
+    )
+    service.repository.update_job(
+        first["id"], status="fetching_details", stage="fetching_details"
+    )
+    service._upstream_call(
+        first["id"], lambda: observed.append(clock["now"]), detail=True
+    )
+    service.repository.update_job(
+        second["id"], status="enumerating", stage="enumerating"
+    )
+    service._upstream_call(
+        second["id"], lambda: observed.append(clock["now"]), detail=False
+    )
+
+    assert observed == pytest.approx([5.0, 10.0, 15.0])
+
+
+def test_concurrent_calls_cannot_reserve_the_same_global_slot(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    service.settings = replace(
+        service.settings,
+        pause_min_seconds=0.12,
+        pause_max_seconds=0.12,
+    )
+    service._next_request_at = time.monotonic()
+    jobs = [
+        service.repository.create_job(
+            source={"type": "keyword", "keyword": keyword, "limit": 1},
+            content={"preset": "basic", "fields": ["author"]},
+            adapter_version=service.adapter_version,
+            account_fingerprint="account-1",
+        )
+        for keyword in ("first", "second")
+    ]
+    for job in jobs:
+        service.repository.update_job(
+            job["id"], status="enumerating", stage="enumerating"
+        )
+
+    barrier = threading.Barrier(3)
+    entered: list[float] = []
+    errors: list[BaseException] = []
+
+    def run(job_id: str) -> None:
+        try:
+            barrier.wait(timeout=2)
+            service._upstream_call(
+                job_id,
+                lambda: entered.append(time.monotonic()),
+                detail=False,
+            )
+        except BaseException as error:  # pragma: no cover - assertion reports it
+            errors.append(error)
+
+    threads = [threading.Thread(target=run, args=(job["id"],)) for job in jobs]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=2)
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert not errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(entered) == 2
+    assert abs(entered[1] - entered[0]) >= 0.09
+
+
+@pytest.mark.parametrize("behavior", ["raise", "no_header", "zero"])
+def test_rate_limit_fallback_and_full_retry_after_are_persisted(
+    behavior: str,
+    tmp_path: Path,
+) -> None:
+    class LimitedAdapter(FakeAdapter):
+        def keyword_page(self, keyword, cursor):
+            del keyword, cursor
+            retry_after = (
+                100_000 if behavior == "raise" else 0 if behavior == "zero" else None
+            )
+            raise AdapterError(AdapterErrorCode.RATE_LIMITED, retry_after=retry_after)
+
+    service = _service(tmp_path, LimitedAdapter())
+    service.start()
+    try:
+        job = service.create(
+            CreateJobRequest.model_validate(
+                {
+                    "source": {"type": "keyword", "keyword": "露营", "limit": 1},
+                    "content": {"preset": "basic"},
+                }
+            )
+        )
+        paused = _wait(service, job["id"], {"paused_rate_limit"})
+        until = datetime.fromisoformat(paused["account_cooldown_until"])
+        remaining = (until - datetime.now(UTC)).total_seconds()
+        expected = 100_000 if behavior == "raise" else 15 * 60
+        assert expected - 2 <= remaining <= expected + 1
+    finally:
+        service.stop()
+
+
+def test_cancel_waits_for_inflight_then_admits_no_new_request(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingAdapter(FakeAdapter):
+        calls = 0
+
+        def keyword_page(self, keyword, cursor):
+            del keyword, cursor
+            self.calls += 1
+            entered.set()
+            assert release.wait(2)
+            return PageResult(
+                items=[{"note_id": "n1", "source_page": 1}],
+                next_cursor={"page": 2},
+                has_more=True,
+                raw_item_count=1,
+            )
+
+    adapter = BlockingAdapter()
+    service = _service(tmp_path, adapter)
+    service.start()
+    try:
+        job = service.create(
+            CreateJobRequest.model_validate(
+                {
+                    "source": {"type": "keyword", "keyword": "露营", "limit": 2},
+                    "content": {"preset": "basic"},
+                }
+            )
+        )
+        assert entered.wait(2)
+        result: dict[str, object] = {}
+
+        def cancel() -> None:
+            result.update(service.cancel(job["id"]))
+
+        thread = threading.Thread(target=cancel)
+        thread.start()
+        time.sleep(0.05)
+        release.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        _wait(service, job["id"], {"cancelled"})
+        time.sleep(0.05)
+        assert adapter.calls == 1
+        assert service.get(job["id"])["list_requests"] == 1
+    finally:
+        release.set()
+        service.stop()
+
+
+def test_network_retry_after_pauses_immediately_until_explicit_resume(
+    tmp_path: Path,
+) -> None:
+    class DirectedWaitAdapter(FakeAdapter):
+        calls = 0
+
+        def keyword_page(self, keyword, cursor):
+            del keyword, cursor
+            self.calls += 1
+            raise AdapterError(AdapterErrorCode.NETWORK_ERROR, retry_after=7200)
+
+    adapter = DirectedWaitAdapter()
+    service = _service(tmp_path, adapter)
+    service.start()
+    try:
+        job = service.create(
+            CreateJobRequest.model_validate(
+                {
+                    "source": {"type": "keyword", "keyword": "露营", "limit": 1},
+                    "content": {"preset": "basic"},
+                }
+            )
+        )
+        paused = _wait(service, job["id"], {"paused_interrupted"})
+        assert adapter.calls == 1
+        assert paused["list_requests"] == 1
+        assert paused["retry_after_at"]
+        with pytest.raises(ValueError, match="平台要求等待"):
+            service.resume(job["id"])
+    finally:
+        service.stop()
+
+
+def test_network_retry_after_freezes_sibling_jobs_account_wide(
+    tmp_path: Path,
+) -> None:
+    class DirectedWaitAdapter(FakeAdapter):
+        calls = 0
+
+        def keyword_page(self, keyword, cursor):
+            del keyword, cursor
+            self.calls += 1
+            raise AdapterError(AdapterErrorCode.NETWORK_ERROR, retry_after=7200)
+
+    adapter = DirectedWaitAdapter()
+    service = _service(tmp_path, adapter)
+    payload = CreateJobRequest.model_validate(
+        {
+            "source": {"type": "keyword", "keyword": "露营", "limit": 1},
+            "content": {"preset": "basic"},
+        }
+    )
+    first = service.create(payload)
+    second = service.create(payload)
+    service.start()
+    try:
+        paused = _wait(service, first["id"], {"paused_interrupted"})
+        assert paused["account_cooldown_reason"] == "NETWORK_ERROR"
+        time.sleep(0.1)
+        frozen = service.get(second["id"])
+        assert frozen["status"] == "paused_interrupted"
+        assert frozen["error_code"] == "NETWORK_ERROR"
+        assert adapter.calls == 1
+        with pytest.raises(ValueError) as captured:
+            service.create(payload)
+        assert getattr(captured.value, "code", None) == AdapterErrorCode.NETWORK_ERROR
+    finally:
+        service.stop()
+
+
+def test_network_retry_after_zero_uses_transient_backoff_not_cooldown(
+    tmp_path: Path,
+) -> None:
+    class ZeroWaitAdapter(FakeAdapter):
+        calls = 0
+
+        def keyword_page(self, keyword, cursor):
+            self.calls += 1
+            if self.calls == 1:
+                raise AdapterError(AdapterErrorCode.NETWORK_ERROR, retry_after=0)
+            return super().keyword_page(keyword, cursor)
+
+    adapter = ZeroWaitAdapter()
+    service = _service(tmp_path, adapter)
+    service.start()
+    try:
+        job = service.create(
+            CreateJobRequest.model_validate(
+                {
+                    "source": {"type": "keyword", "keyword": "露营", "limit": 1},
+                    "content": {"preset": "basic"},
+                }
+            )
+        )
+        done = _wait(service, job["id"], {"completed", "completed_with_warnings"})
+        assert done["status"] == "completed"
+        assert adapter.calls == 2
+        assert done["account_cooldown_until"] is None
+        assert done["account_cooldown_reason"] is None
+    finally:
+        service.stop()
+
+
+def test_page_budget_stops_before_the_next_request_and_cannot_resume(
+    tmp_path: Path,
+) -> None:
+    class EndlessAdapter(FakeAdapter):
+        calls = 0
+
+        def keyword_page(self, keyword, cursor):
+            del keyword
+            self.calls += 1
+            page = int(cursor["page"])
+            return PageResult(
+                items=[{"note_id": f"n{page}", "source_page": page}],
+                next_cursor={"page": page + 1},
+                has_more=True,
+                raw_item_count=1,
+            )
+
+    adapter = EndlessAdapter()
+    service = _service(tmp_path, adapter)
+    job = service.repository.create_job(
+        source={"type": "keyword", "keyword": "budget", "limit": 20},
+        content={"preset": "basic", "fields": ["author"]},
+        adapter_version=adapter.version,
+        account_fingerprint="account-1",
+        request_budget=10,
+        page_budget=1,
+        retry_budget=3,
+    )
+    service.start()
+    try:
+        paused = _wait(service, job["id"], {"paused_interrupted"})
+        assert adapter.calls == 1
+        assert paused["pages_requested"] == 1
+        assert paused["list_requests"] == 1
+        assert paused["error_code"] == "REQUEST_BUDGET_EXHAUSTED"
+        with pytest.raises(ValueError, match="不能恢复"):
+            service.resume(job["id"])
+    finally:
+        service.stop()
+
+
+def test_request_budget_counts_network_retries_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    class AlwaysNetworkAdapter(FakeAdapter):
+        calls = 0
+
+        def keyword_page(self, keyword, cursor):
+            del keyword, cursor
+            self.calls += 1
+            raise AdapterError(AdapterErrorCode.NETWORK_ERROR)
+
+    adapter = AlwaysNetworkAdapter()
+    service = _service(tmp_path, adapter)
+    job = service.repository.create_job(
+        source={"type": "keyword", "keyword": "budget", "limit": 20},
+        content={"preset": "basic", "fields": ["author"]},
+        adapter_version=adapter.version,
+        account_fingerprint="account-1",
+        request_budget=2,
+        page_budget=10,
+        retry_budget=10,
+    )
+    service.start()
+    try:
+        paused = _wait(service, job["id"], {"paused_interrupted"})
+        assert adapter.calls == 2
+        assert paused["list_requests"] == 2
+        assert paused["pages_requested"] == 0
+        assert paused["retry_attempts"] == 1
+        assert paused["error_code"] == "REQUEST_BUDGET_EXHAUSTED"
+    finally:
+        service.stop()
+
+    restarted = _service(tmp_path, adapter)
+    with pytest.raises(ValueError, match="不能恢复"):
+        restarted.resume(job["id"])
+    assert restarted.get(job["id"])["list_requests"] == 2
+    assert adapter.calls == 2
+
+
+def test_detail_budget_exhaustion_pauses_without_extra_detail_request(
+    tmp_path: Path,
+) -> None:
+    class CountingDetailAdapter(FakeAdapter):
+        detail_calls = 0
+
+        def note_detail(self, note_id, private):
+            self.detail_calls += 1
+            return super().note_detail(note_id, private)
+
+    adapter = CountingDetailAdapter()
+    service = _service(tmp_path, adapter)
+    job = service.repository.create_job(
+        source={"type": "keyword", "keyword": "budget", "limit": 1},
+        content={"preset": "full", "fields": ["author", "body"]},
+        adapter_version=adapter.version,
+        account_fingerprint="account-1",
+        request_budget=1,
+        page_budget=10,
+        retry_budget=3,
+    )
+    service.repository.update_job(
+        job["id"], status="enumerating", stage="enumerating"
+    )
+    assert (
+        service.repository.reserve_request(
+            job["id"], detail=False, retry_hint=False
+        )
+        is None
+    )
+    service.repository.save_page(
+        job["id"],
+        cursor={"page": 1},
+        next_cursor=None,
+        has_more=False,
+        items=[{"note_id": "n1", "source_page": 1}],
+        raw_count=1,
+        skipped_count=0,
+        limit=1,
+    )
+    service.repository.update_job(job["id"], status="queued", stage="queued")
+
+    service.start()
+    try:
+        paused = _wait(service, job["id"], {"paused_interrupted"})
+        assert adapter.detail_calls == 0
+        assert paused["detail_requests"] == 0
+        assert paused["detail_failed"] == 0
+        assert paused["error_code"] == "REQUEST_BUDGET_EXHAUSTED"
+        with pytest.raises(ValueError, match="不能恢复"):
+            service.resume(job["id"])
     finally:
         service.stop()

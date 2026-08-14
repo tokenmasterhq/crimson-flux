@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 from dataclasses import dataclass
@@ -27,11 +28,14 @@ def _int_env(
     default: int,
     *,
     minimum: int = 0,
+    maximum: int | None = None,
     legacy: str | None = None,
 ) -> int:
     value = int(_env(name, legacy=legacy, default=str(default)) or str(default))
     if value < minimum:
         raise ValueError(f"{name} must be >= {minimum}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be <= {maximum}")
     return value
 
 
@@ -63,6 +67,7 @@ class Settings:
     pause_min_seconds: float
     pause_max_seconds: float
     open_browser: bool
+    max_job_retries: int = 12
 
     def __post_init__(self) -> None:
         """Enforce the bind boundary for every construction path.
@@ -103,8 +108,13 @@ class Settings:
             )
             or "4"
         )
-        if pause_min < 0 or pause_max < pause_min:
-            raise ValueError("request pause range is invalid")
+        if (
+            not math.isfinite(pause_min)
+            or not math.isfinite(pause_max)
+            or pause_min < 2
+            or pause_max < pause_min
+        ):
+            raise ValueError("request pause range must be at least 2 seconds")
         export_override = _env(
             "CRIMSONFLUX_EXPORT_DIR",
             legacy="XHS_INSIGHT_EXPORT_DIR",
@@ -133,6 +143,12 @@ class Settings:
             pause_max_seconds=pause_max,
             open_browser=not _bool_env(
                 "CRIMSONFLUX_NO_BROWSER", legacy="XHS_INSIGHT_NO_BROWSER"
+            ),
+            max_job_retries=_int_env(
+                "CRIMSONFLUX_MAX_JOB_RETRIES",
+                12,
+                minimum=0,
+                maximum=20,
             ),
         )
 

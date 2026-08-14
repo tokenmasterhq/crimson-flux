@@ -103,6 +103,135 @@ def test_http_client_disables_environment_proxies(monkeypatch: pytest.MonkeyPatc
     assert captured["trust_env"] is False
 
 
+def test_cli_client_preserves_safe_retry_metadata() -> None:
+    request = cli_client.httpx.Request("POST", "http://127.0.0.1:8765/api/v1/jobs/job-1/resume")
+    response = cli_client.httpx.Response(
+        429,
+        request=request,
+        json={
+            "detail": {
+                "code": "RATE_LIMITED",
+                "message": "平台要求等待。",
+                "retry_after": 65,
+                "retry_after_at": "2099-01-01T00:00:00+00:00",
+            }
+        },
+    )
+
+    error = cli_client._error_from_response(response)
+
+    assert error.code == "RATE_LIMITED"
+    assert error.retry_after == 65
+    assert error.retry_after_at == "2099-01-01T00:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["collect", "keyword", "露营", "--yes"],
+        ["jobs", "resume", "job-1", "--yes"],
+    ],
+)
+def test_cli_direct_actions_show_rate_limit_deadline(
+    command: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RateLimitedClient(FakeClient):
+        def get(self, path: str) -> Any:
+            if path == "/jobs/job-1":
+                return _public_job(status="paused_rate_limit")
+            return super().get(path)
+
+        def post(self, path: str, body: Any = None) -> Any:
+            raise cli_client.ApiError(
+                "平台要求等待。",
+                code="RATE_LIMITED",
+                status=429,
+                retry_after=65,
+            )
+
+    monkeypatch.setattr(cli_app, "_client", lambda **_kwargs: RateLimitedClient())
+
+    result = runner.invoke(cli_app.app, command)
+
+    assert result.exit_code == 1, result.output
+    assert "平台要求暂时等待" in result.output
+    assert "本地时间" in result.output
+    assert "约 65 秒" in result.output
+
+
+def test_cli_rate_limit_deadline_saturates_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class VeryLongCooldownClient(FakeClient):
+        def get(self, path: str) -> Any:
+            if path == "/jobs/job-1":
+                return _public_job(status="paused_rate_limit")
+            return super().get(path)
+
+        def post(self, path: str, body: Any = None) -> Any:
+            raise cli_client.ApiError(
+                "平台要求等待。",
+                code="RATE_LIMITED",
+                status=429,
+                retry_after=10**100,
+            )
+
+    monkeypatch.setattr(cli_app, "_client", lambda **_kwargs: VeryLongCooldownClient())
+
+    result = runner.invoke(cli_app.app, ["jobs", "resume", "job-1", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "本地时间 999" in result.output
+    assert "OverflowError" not in result.output
+
+
+def test_cli_budget_exhaustion_does_not_offer_or_post_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BudgetClient(FakeClient):
+        def get(self, path: str) -> Any:
+            if path == "/jobs/job-1":
+                job = _public_job(status="paused_interrupted")
+                job["error_code"] = "REQUEST_BUDGET_EXHAUSTED"
+                return job
+            return super().get(path)
+
+    fake = BudgetClient()
+    monkeypatch.setattr(cli_app, "_client", lambda **_kwargs: fake)
+
+    result = runner.invoke(cli_app.app, ["jobs", "resume", "job-1", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "已达到本地安全请求上限" in result.output
+    assert fake.posts == []
+
+
+def test_cli_network_retry_after_uses_wait_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NetworkRetryClient(FakeClient):
+        def get(self, path: str) -> Any:
+            if path == "/jobs/job-1":
+                return _public_job(status="paused_interrupted")
+            return super().get(path)
+
+        def post(self, path: str, body: Any = None) -> Any:
+            raise cli_client.ApiError(
+                "网络请求失败。",
+                code="NETWORK_ERROR",
+                status=503,
+                retry_after=30,
+            )
+
+    monkeypatch.setattr(cli_app, "_client", lambda **_kwargs: NetworkRetryClient())
+
+    result = runner.invoke(cli_app.app, ["jobs", "resume", "job-1", "--yes"])
+
+    assert result.exit_code == 1, result.output
+    assert "服务或网络暂时不可用" in result.output
+    assert "约 30 秒" in result.output
+
+
 def test_instance_file_is_rejected_before_reading_symlink(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -620,3 +749,108 @@ def test_web_polish_keeps_polling_stable_accessible_and_cache_safe() -> None:
     assert invalid_cookie_branch.index('elements.cookieInput.value = "";') < (
         invalid_cookie_branch.index("showToast(")
     )
+
+
+def test_web_job_pause_guidance_is_cooldown_aware_and_announced_once() -> None:
+    root = Path(__file__).resolve().parents[2]
+    template = (root / "src/xhs_insight/web/templates/index.html").read_text(encoding="utf-8")
+    script = (root / "src/xhs_insight/web/static/app.js").read_text(encoding="utf-8")
+    styles = (root / "src/xhs_insight/web/static/styles.css").read_text(encoding="utf-8")
+
+    assert "function jobResumeAt(job)" in script
+    assert "job?.retry_after_at" in script
+    assert "job?.account_cooldown_until" in script
+    assert "function refreshCooldownDisplays()" in script
+    assert "resume.disabled = resumeAt > Date.now()" in script
+    assert "function announceJobTransitions(jobs)" in script
+    assert "previous && previous !== job.status" in script
+    assert 'state.jobStatuses = nextStatuses' in script
+    assert 'className = "job-pause-guidance"' not in script
+    assert 'element("p", "job-pause-guidance"' in script
+    assert ".job-pause-guidance" in styles
+    assert "AbortController" in script
+    assert "15000" in script
+    assert "const sameDay =" in script
+    assert 'year: "numeric"' in script
+    assert "error.retryAfterAt" in script
+    assert '`[需处理] ${BASE_DOCUMENT_TITLE}`' in script
+    assert "Notification.requestPermission" not in script
+    assert 'id="account-cooldown-banner"' in template
+    assert "function renderAccountCooldown" in script
+    assert "state.accountCoolingDown !== waiting" in script
+    assert "hasAdvertisedAccountCooldown" in script
+    assert "await loadHealth({ quiet: true })" in script
+    assert 'job.error_code !== "REQUEST_BUDGET_EXHAUSTED"' in script
+    assert "已达到本地安全请求上限" in script
+
+
+def test_web_mutation_errors_refresh_current_account_cooldown() -> None:
+    root = Path(__file__).resolve().parents[2]
+    script = (root / "src/xhs_insight/web/static/app.js").read_text(encoding="utf-8")
+
+    predicate = script[
+        script.index("function shouldRefreshCooldownAfterMutationError(error)") :
+        script.index("async function refreshCooldownAfterMutationError(error)")
+    ]
+    assert "error.status === 429" in predicate
+    assert "error.status === 503" in predicate
+    assert 'error.code === "NETWORK_ERROR"' in predicate
+    assert "error.retryAfter !== null" in predicate
+    assert "error.retryAfterAt !== null" in predicate
+
+    refresh_helper = script[
+        script.index("async function refreshCooldownAfterMutationError(error)") :
+        script.index("function setServerAvailable(available)")
+    ]
+    assert "await loadHealth({ quiet: true })" in refresh_helper
+
+    create_job = script[
+        script.index("async function createJob(event)") :
+        script.index("function normalizeJobs(payload)")
+    ]
+    confirm_details = script[
+        script.index("async function submitDetailDecision(content, successMessage)") :
+        script.index("async function confirmDetails(event)")
+    ]
+    job_action = script[
+        script.index("async function runJobAction(action, jobId, button)") :
+        script.index("function bindEvents()")
+    ]
+    for mutation in (create_job, confirm_details, job_action):
+        assert "await refreshCooldownAfterMutationError(error)" in mutation
+    assert "if (refreshedCooldown) refreshCooldownDisplays()" in job_action
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("paused_auth", "crimsonflux login"),
+        ("paused_rate_limit", "请等待到本地时间"),
+        ("paused_interrupted", "进度已保存"),
+        ("paused_cursor_invalid", "按原设置创建新任务"),
+    ],
+)
+def test_cli_watch_stops_with_plain_language_next_step(
+    status: str,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _public_job(status=status)
+    if status == "paused_rate_limit":
+        job["retry_after_at"] = "2099-01-01T00:00:00+00:00"
+
+    class PausedClient(FakeClient):
+        def get(self, path: str) -> Any:
+            if path == "/jobs/job-1":
+                return job
+            return super().get(path)
+
+    monkeypatch.setattr(cli_app, "_client", lambda **_kwargs: PausedClient())
+    result = runner.invoke(cli_app.app, ["jobs", "show", "job-1", "--watch"])
+
+    assert result.exit_code == 0, result.output
+    assert expected in result.output
+    if status == "paused_rate_limit":
+        assert "2099-01-01" in result.output
+    assert "任务当前不再自动变化，已停止刷新" in result.output
+    assert "刷新时间" not in result.output

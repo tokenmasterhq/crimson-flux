@@ -320,6 +320,16 @@ def _python_security_findings(relative: PurePosixPath, payload: bytes) -> list[F
     except SyntaxError:
         return [Finding(path, "Python source is invalid")]
     findings: list[Finding] = []
+    if (
+        relative == _CANONICAL_BROWSER_LOGIN
+        and b"_create_owned_profile_root_at(Path(tempfile.gettempdir()))" in payload
+    ):
+        findings.append(
+            Finding(
+                path,
+                "Windows browser profile root may trust environment-selected tempfile path",
+            )
+        )
     imported_roots: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

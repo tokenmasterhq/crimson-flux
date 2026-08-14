@@ -1,5 +1,5 @@
 """SQLite persistence."""
 
-from .repository import Repository
+from .repository import AccountCooldownError, Repository
 
-__all__ = ["Repository"]
+__all__ = ["AccountCooldownError", "Repository"]

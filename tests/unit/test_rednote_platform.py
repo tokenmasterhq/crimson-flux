@@ -421,7 +421,7 @@ def test_authenticated_cookie_requires_a1_and_web_session() -> None:
         )
 
 
-def test_retry_after_is_bounded_and_carried_without_response_text() -> None:
+def test_retry_after_is_carried_without_response_text() -> None:
     transport = FakeTransport(
         TransportResponse(
             429,
@@ -437,7 +437,7 @@ def test_retry_after_is_bounded_and_carried_without_response_text() -> None:
     with pytest.raises(RedNoteProtocolError) as captured:
         client.get_user_me()
     assert captured.value.kind == FailureKind.RATE_LIMIT
-    assert captured.value.retry_after == 60 * 60
+    assert captured.value.retry_after == 100_000
     assert "secret upstream message" not in repr(captured.value)
 
 
@@ -525,5 +525,5 @@ def test_http_transport_bounds_decompressed_json_and_parses_retry_after() -> Non
         body=None,
         max_response_bytes=256 * 1024,
     )
-    assert response.retry_after == 60 * 60
+    assert response.retry_after == 999_999
     transport.close()

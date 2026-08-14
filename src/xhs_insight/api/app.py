@@ -37,6 +37,15 @@ SAFE_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
+class CredentialChangeConflict(PermissionError):
+    code = "CREDENTIAL_CHANGE_CONFLICT"
+    retryable = False
+
+    def __init__(self) -> None:
+        self.public_message = "登录状态已在验证期间发生变化，本次验证结果未保存。"
+        super().__init__(self.public_message)
+
+
 @dataclass(slots=True)
 class Backend:
     settings: Settings
@@ -54,6 +63,13 @@ class Backend:
 
     def collector_doctor(self) -> dict[str, Any]:
         result = {"mode": "live", **runtime_doctor().as_dict()}
+        cooldown = self.repository.account_cooldown(self.auth.account_fingerprint)
+        result["account_cooldown_until"] = (
+            cooldown["cooldown_until"] if cooldown is not None else None
+        )
+        result["account_cooldown_reason"] = (
+            cooldown["reason_code"] if cooldown is not None else None
+        )
         if self.browser_login is not None:
             result.update(self.browser_login.capability())
         return result
@@ -71,8 +87,8 @@ class Backend:
         if self.browser_login is not None:
             self.browser_login.cancel()
         with self._credential_lock:
-            self.adapter.close()
             self.auth.logout()
+            self.adapter.close()
 
     def import_cookie(
         self,
@@ -82,34 +98,45 @@ class Backend:
     ) -> dict[str, Any]:
         """Verify a Cookie against XHS before committing its encrypted state."""
 
-        with self._credential_lock:
-            if callable(cancelled) and cancelled():
-                raise PermissionError("扫码登录已取消，登录态未保存")
-            if self.repository.has_running_or_queued_jobs():
-                raise PermissionError("请先取消或暂停正在运行、排队的任务，再更换登录态")
-            verified = self.adapter.verify_cookie(cookie)
-            # Verification is a network operation. Re-check after it returns so
-            # a task queued concurrently cannot have its credential replaced.
-            if self.repository.has_running_or_queued_jobs():
-                raise PermissionError("验证期间已有任务开始运行，登录态未保存")
-            if callable(cancelled) and cancelled():
-                raise PermissionError("扫码登录已取消，登录态未保存")
-            # The isolated browser supplies a cleanup barrier here.  Its CDP
-            # endpoint, process and temporary profile must be gone before the
-            # verified credential can become available to collection jobs. A
-            # browser-login callback may return a commit guard that linearizes
-            # the final stop check, persistence, and committed marker.
-            commit_guard: Any = nullcontext()
-            if callable(before_persist):
-                candidate_guard = before_persist()
-                if candidate_guard is not None:
-                    commit_guard = candidate_guard
-            with commit_guard:
+        initial_generation = getattr(self.auth, "session_generation", None)
+        if callable(cancelled) and cancelled():
+            raise PermissionError("扫码登录已取消，登录态未保存")
+        if self.repository.has_running_or_queued_jobs():
+            raise PermissionError("请先取消或暂停正在运行、排队的任务，再更换登录态")
+        # Verification may be a slow network operation. Keep it outside both the
+        # credential commit lock and the SQLite writer transaction; only the
+        # final, already-verified commit needs to be serialized.
+        verified = self.adapter.verify_cookie(cookie)
+        # Re-check after verification for prompt feedback. The atomic repository
+        # check inside persist_verified_login is the authoritative race boundary.
+        if self.repository.has_running_or_queued_jobs():
+            raise PermissionError("验证期间已有任务开始运行，登录态未保存")
+        if callable(cancelled) and cancelled():
+            raise PermissionError("扫码登录已取消，登录态未保存")
+        # The isolated browser supplies a cleanup barrier here.  Its CDP
+        # endpoint, process and temporary profile must be gone before the
+        # verified credential can become available to collection jobs. A
+        # browser-login callback may return a commit guard that linearizes
+        # the final stop check, persistence, and committed marker.
+        commit_guard: Any = nullcontext()
+        if callable(before_persist):
+            candidate_guard = before_persist()
+            if candidate_guard is not None:
+                commit_guard = candidate_guard
+        # Keep this explicit nesting: the G1 contract scanner verifies that the
+        # browser cleanup guard directly encloses credential persistence.
+        with commit_guard:  # noqa: SIM117
+            with self._credential_lock:
+                if (
+                    initial_generation is not None
+                    and getattr(self.auth, "session_generation", None)
+                    != initial_generation
+                ):
+                    raise CredentialChangeConflict
                 if self.repository.has_running_or_queued_jobs():
                     raise PermissionError("验证期间已有任务开始运行，登录态未保存")
                 if callable(cancelled) and cancelled():
                     raise PermissionError("扫码登录已取消，登录态未保存")
-                self.adapter.close()
                 return self.auth.persist_verified_login(
                     cookie=verified.cookie,
                     account_id=verified.account_id,

@@ -49,11 +49,12 @@ Cookie 的唯一 CDP 查询范围是：
 
 - 仅允许规范模块 `src/xhs_insight/browser_login.py` 启动或控制浏览器；其他产品模块出现浏览器自动化/CDP 标记即发布阻断。
 - 只从按操作系统审计的 Chrome、Edge、Chromium 固定路径中选择可执行文件；Windows 根目录必须由 `SHGetKnownFolderPath` 取得并拼接源码固定的 vendor suffix，不能读取 `PATH`、`PROGRAMFILES`、`PROGRAMFILES(X86)`、`LOCALAPPDATA` 或其他环境变量。Known Folder API 失败时自动登录 fail closed。禁止任意路径、PATH 注入、下载浏览器或自定义 executable。
-- 原生三平台都必须在 `tempfile` 返回的操作系统临时目录下创建 CrimsonFlux 专用私有根，再为每次登录原子创建随机 `--user-data-dir`；不得把 Profile 放入持久 `state_dir`，不得接受 UI、配置或环境变量指定 Profile 根，也不得覆盖 `tempfile.tempdir`。
-- 专用根和 Profile 必须验证为本进程创建并持续登记的真实目录：校验随机 nonce、私有 ownership marker、创建时文件身份、直接父目录、固定名称和非 symlink/junction/reparse。POSIX 还要求当前 UID 且权限不超过 `0700`。仅有名称前缀不能证明目录归属。
+- macOS/POSIX 在 `tempfile` 返回的系统临时目录下创建 `0700`、当前 UID 所有的 CrimsonFlux 专用私有根。Windows 不信任 `TEMP`、`TMP` 或 `tempfile.gettempdir()` 的环境选择：必须通过 `SHGetKnownFolderPath(FOLDERID_LocalAppData)` 取得当前用户目录，再只拼接固定 `Temp` 后缀并验证目录所有者 SID。任一 API、路径、所有者或身份校验失败时自动登录 fail closed。
+- 专用根和每个随机 `--user-data-dir` 必须验证为本进程创建并持续登记的真实目录：校验随机 nonce、私有 ownership marker、创建时文件身份、直接父目录、固定名称和非 symlink/junction/reparse。POSIX 要求当前 UID 且权限不超过 `0700`；Windows 必须在 `CreateDirectoryW` 创建时通过 `SECURITY_ATTRIBUTES` 原子施加 protected DACL，DACL 只能包含当前进程 token 用户 SID 的可继承 Full Access ACE，并在使用、清理前通过 `GetFileSecurityW` 严格复核 owner 与完整 DACL。ownership marker 同样必须用 `CreateFileW` 和当前 SID 的 protected DACL 原子创建、用 `WriteFile`/`FlushFileBuffers` 写入后复核，Windows 自动登录链不得读取 `USERNAME`/`USERDOMAIN` 或通过 PATH 调用 `icacls`。仅有名称前缀、`chmod` 或继承 ACL 都不能证明 Windows 对象私有。
+- 不得把 Profile 放入持久 `state_dir`，不得接受 UI、配置或环境变量指定 Profile 根，也不得覆盖 `tempfile.tempdir`；不得通过 WorkBuddy safe-delete 开关、shell 或外部删除器绕过清理失败。
 - CDP 只监听 `127.0.0.1`，使用浏览器分配的随机端口；严格校验 `DevToolsActivePort` 内容、端口范围和回环调试地址。
 - `subprocess` 只接受固定 argv 列表，`shell=False`，stdout/stderr 丢弃；Cookie 不进入 argv、环境变量、工作目录或输出。
-- Windows 关闭窗口时只能对本次 `Popen` 返回的正整数 PID 调用系统目录中的 `taskkill.exe /PID <pid> /T /F`；禁止 `/IM`、进程名、通配符或任何外部 PID。调用必须 `shell=False`、输入输出丢弃且有严格超时，失败后只允许对同一 owned `Popen` 做有界 `kill/wait`。
+- Windows 关闭窗口时只能对本次 `Popen` 返回的正整数 PID 调用 `GetSystemDirectoryW` 返回目录中的 `taskkill.exe /PID <pid> /T /F`；禁止猜测 `C:\Windows`、使用环境变量或 PATH fallback，也禁止 `/IM`、进程名、通配符或任何外部 PID。系统 API 不可用或返回异常路径时必须跳过外部 helper，只对同一 owned `Popen` 做有界 `kill/wait`。调用必须 `shell=False`、输入输出丢弃且有严格超时。
 - 禁止 `--no-sandbox`、`--disable-web-security`、通配 `--remote-allow-origins=*` 以及关闭同源/沙箱保护的参数。
 - Docker、无 GUI 环境或没有 allowlist 浏览器时明确显示“不支持自动登录”，保留用户主动手动导入入口；不得静默降级到不安全启动方式。
 

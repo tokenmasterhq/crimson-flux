@@ -171,6 +171,7 @@ def _app(settings: Settings):
     repository = Repository(settings.state_dir / "xhs-insight.sqlite3")
     cipher = CredentialCipher(settings.state_dir / "master.key")
     auth = SyntheticAuth()
+    repository.save_auth(b"synthetic-auth", auth.account_fingerprint)
     adapter = SyntheticAdapter()
     exporter = Exporter(repository, settings.export_dir, collector_version=adapter.version)
     jobs = JobService(

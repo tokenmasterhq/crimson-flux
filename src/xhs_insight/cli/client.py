@@ -28,10 +28,20 @@ class ClientConfigurationError(RuntimeError):
 class ApiError(RuntimeError):
     """A structured local API failure with a safe public message."""
 
-    def __init__(self, message: str, *, code: str | None = None, status: int = 0):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        status: int = 0,
+        retry_after: int | None = None,
+        retry_after_at: str | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.status = status
+        self.retry_after = retry_after
+        self.retry_after_at = retry_after_at
 
 
 def instance_file() -> Path:
@@ -156,12 +166,29 @@ def _error_from_response(response: httpx.Response) -> ApiError:
     if isinstance(candidate, dict):
         message = str(candidate.get("message") or candidate.get("msg") or "").strip()
         code_value = candidate.get("code")
+        retry_after_value = candidate.get("retry_after")
+        retry_after_at_value = candidate.get("retry_after_at") or candidate.get(
+            "resume_not_before"
+        )
     else:
         message = str(candidate or "").strip()
         code_value = payload.get("code") if isinstance(payload, dict) else None
+        retry_after_value = None
+        retry_after_at_value = None
+    try:
+        retry_after = max(0, int(str(retry_after_value)))
+    except (TypeError, ValueError):
+        retry_after = None
+    retry_after_at = str(retry_after_at_value) if retry_after_at_value else None
     if not message:
         message = f"本地服务返回错误（HTTP {response.status_code}）"
-    return ApiError(message, code=str(code_value) if code_value else None, status=response.status_code)
+    return ApiError(
+        message,
+        code=str(code_value) if code_value else None,
+        status=response.status_code,
+        retry_after=retry_after,
+        retry_after_at=retry_after_at,
+    )
 
 
 def _safe_filename(value: str) -> str | None:

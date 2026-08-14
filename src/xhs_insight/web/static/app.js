@@ -2,6 +2,7 @@
   "use strict";
 
   const API_BASE = (document.body.dataset.apiBase || "/api/v1").replace(/\/$/, "");
+  const BASE_DOCUMENT_TITLE = document.title;
   const DETAIL_FIELDS = new Set(["body", "tags", "metrics", "media"]);
   const ACTIVE_STATUSES = new Set(["queued", "enumerating", "fetching_details", "exporting"]);
   const PAUSED_STATUSES = new Set([
@@ -15,6 +16,13 @@
     "completed_with_warnings",
     "cancelled",
     "failed",
+  ]);
+  const ATTENTION_STATUSES = new Set([
+    "paused_auth",
+    "paused_rate_limit",
+    "paused_interrupted",
+    "paused_cursor_invalid",
+    ...TERMINAL_STATUSES,
   ]);
   const BROWSER_LOGIN_ACTIVE = new Set([
     "starting",
@@ -77,6 +85,9 @@
       pauseMaxSeconds: 4,
     },
     jobsTimer: null,
+    cooldownTimer: null,
+    jobStatuses: new Map(),
+    accountCoolingDown: false,
     browserLoginTimer: null,
     browserLoginDeadlineMs: null,
     manualLoginAutoOpened: false,
@@ -130,6 +141,8 @@
     jobsEmpty: document.querySelector("#jobs-empty"),
     refreshJobs: document.querySelector("#refresh-jobs"),
     clearData: document.querySelector("#clear-data"),
+    accountCooldownBanner: document.querySelector("#account-cooldown-banner"),
+    accountCooldownMessage: document.querySelector("#account-cooldown-message"),
     detailDialog: document.querySelector("#detail-confirm-dialog"),
     confirmSummary: document.querySelector("#confirm-summary"),
     confirmEstimate: document.querySelector("#confirm-estimate"),
@@ -141,11 +154,16 @@
   };
 
   class ApiError extends Error {
-    constructor(message, { code = null, status = 0 } = {}) {
+    constructor(
+      message,
+      { code = null, status = 0, retryAfter = null, retryAfterAt = null } = {},
+    ) {
       super(message);
       this.name = "ApiError";
       this.code = code;
       this.status = status;
+      this.retryAfter = retryAfter;
+      this.retryAfterAt = retryAfterAt;
     }
   }
 
@@ -170,6 +188,7 @@
 
   async function api(path, options = {}) {
     const method = String(options.method || "GET").toUpperCase();
+    const { timeoutMs: requestedTimeout, ...requestOptions } = options;
     const headers = new Headers(options.headers || {});
     headers.set("Accept", "application/json");
     if (options.body !== undefined && !(options.body instanceof FormData)) {
@@ -181,43 +200,87 @@
     }
 
     let response;
+    const controller = new AbortController();
+    const timeoutMs = Number.isFinite(Number(requestedTimeout))
+      ? Number(requestedTimeout)
+      : method === "GET" && path.startsWith("/jobs")
+        ? 15000
+        : method === "GET"
+          ? 30000
+          : 120000;
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+    const externalSignal = options.signal;
+    const forwardAbort = () => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) controller.abort();
+      else externalSignal.addEventListener("abort", forwardAbort, { once: true });
+    }
     try {
       response = await fetch(`${API_BASE}${path}`, {
-        ...options,
+        ...requestOptions,
         method,
         headers,
         credentials: "same-origin",
+        signal: controller.signal,
         body:
           options.body !== undefined && !(options.body instanceof FormData)
             ? JSON.stringify(options.body)
             : options.body,
       });
-    } catch (_error) {
-      throw new ApiError("无法连接本地服务。请确认 CrimsonFlux 正在运行。", { code: "OFFLINE" });
-    }
 
-    const contentType = response.headers.get("content-type") || "";
-    let payload = null;
-    if (response.status !== 204) {
-      payload = contentType.includes("application/json")
-        ? await response.json().catch(() => null)
-        : await response.text().catch(() => "");
+      const contentType = response.headers.get("content-type") || "";
+      let payload = null;
+      if (response.status !== 204) {
+        try {
+          payload = contentType.includes("application/json")
+            ? await response.json()
+            : await response.text();
+        } catch (error) {
+          if (error?.name === "AbortError") throw error;
+          payload = contentType.includes("application/json") ? null : "";
+        }
+      }
+      if (!response.ok) {
+        const detail = payload && typeof payload === "object" ? payload.detail : null;
+        const responseError = payload && typeof payload === "object" ? payload.error : null;
+        const candidate = responseError || detail || payload;
+        const message =
+          (candidate && typeof candidate === "object" && (candidate.message || candidate.msg)) ||
+          (typeof candidate === "string" && candidate) ||
+          `本地服务返回错误（HTTP ${response.status}）`;
+        const code =
+          (candidate && typeof candidate === "object" && candidate.code) ||
+          (payload && typeof payload === "object" && payload.code) ||
+          null;
+        const retryAfter =
+          (candidate && typeof candidate === "object" && candidate.retry_after) ||
+          response.headers.get("retry-after") ||
+          null;
+        const retryAfterAt =
+          (candidate && typeof candidate === "object" &&
+            (candidate.retry_after_at || candidate.resume_not_before)) ||
+          null;
+        throw new ApiError(message, {
+          code,
+          status: response.status,
+          retryAfter,
+          retryAfterAt,
+        });
+      }
+      return unwrapPayload(payload);
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      const timedOut = error?.name === "AbortError" && !externalSignal?.aborted;
+      throw new ApiError(
+        timedOut
+          ? "本地服务响应超时，程序会继续尝试刷新。"
+          : "无法连接本地服务。请确认 CrimsonFlux 正在运行。",
+        { code: timedOut ? "TIMEOUT" : "OFFLINE" },
+      );
+    } finally {
+      window.clearTimeout(timeoutId);
+      externalSignal?.removeEventListener?.("abort", forwardAbort);
     }
-    if (!response.ok) {
-      const detail = payload && typeof payload === "object" ? payload.detail : null;
-      const error = payload && typeof payload === "object" ? payload.error : null;
-      const candidate = error || detail || payload;
-      const message =
-        (candidate && typeof candidate === "object" && (candidate.message || candidate.msg)) ||
-        (typeof candidate === "string" && candidate) ||
-        `本地服务返回错误（HTTP ${response.status}）`;
-      const code =
-        (candidate && typeof candidate === "object" && candidate.code) ||
-        (payload && typeof payload === "object" && payload.code) ||
-        null;
-      throw new ApiError(message, { code, status: response.status });
-    }
-    return unwrapPayload(payload);
   }
 
   function setPill(element, text, variant = "neutral") {
@@ -259,10 +322,42 @@
     if (error instanceof ApiError && error.code === "AUTH_EXPIRED") {
       return "登录已过期。请重新打开官方网页登录（或手动导入登录状态）后恢复任务。";
     }
-    if (error instanceof ApiError && error.code === "RATE_LIMITED") {
-      return "平台暂时限制了请求。任务已安全暂停，请稍后恢复。";
+    if (
+      error instanceof ApiError &&
+      ["RATE_LIMITED", "RISK_CONTROLLED", "NETWORK_ERROR"].includes(error.code)
+    ) {
+      const explicit = Date.parse(String(error.retryAfterAt || ""));
+      const seconds = Number(error.retryAfter);
+      const resumeAt = Number.isFinite(explicit)
+        ? explicit
+        : Number.isFinite(seconds) && seconds > 0
+          ? Date.now() + seconds * 1000
+          : null;
+      const reason = error.code === "NETWORK_ERROR" ? "服务或网络暂时不可用" : "平台要求暂时等待";
+      return resumeAt && resumeAt > Date.now()
+        ? `${reason}。可在 ${formatResumeTime(resumeAt)} 后重试（还需 ${formatRemaining(resumeAt - Date.now())}）。`
+        : error.code === "NETWORK_ERROR"
+          ? error.message || "服务或网络暂时不可用，请稍后重试。"
+          : "平台暂时限制了请求。任务已安全暂停，请稍后恢复。";
     }
     return error instanceof Error ? error.message : "发生未知错误";
+  }
+
+  function shouldRefreshCooldownAfterMutationError(error) {
+    return (
+      error instanceof ApiError &&
+      (error.status === 429 ||
+        error.status === 503 ||
+        error.code === "NETWORK_ERROR" ||
+        error.retryAfter !== null ||
+        error.retryAfterAt !== null)
+    );
+  }
+
+  async function refreshCooldownAfterMutationError(error) {
+    if (!shouldRefreshCooldownAfterMutationError(error)) return false;
+    await loadHealth({ quiet: true });
+    return true;
   }
 
   function setServerAvailable(available) {
@@ -291,6 +386,45 @@
       `本次最多可设置 ${state.limits.keyword} 条；如果没有足够结果，最终数量可能会更少。`;
     updateEstimate();
     if (state.auth) renderAuth(state.auth);
+    renderAccountCooldown();
+  }
+
+  function accountCooldownAt() {
+    const raw =
+      state.health?.collector?.account_cooldown_until ||
+      state.health?.collector?.cooldown_until ||
+      state.health?.account_cooldown_until;
+    const timestamp = Date.parse(String(raw || ""));
+    return Number.isFinite(timestamp) && timestamp > Date.now() ? timestamp : null;
+  }
+
+  function renderAccountCooldown(now = Date.now()) {
+    const resumeAt = accountCooldownAt();
+    const waiting = Boolean(resumeAt && resumeAt > now);
+    if (elements.accountCooldownBanner) elements.accountCooldownBanner.hidden = !waiting;
+    if (waiting && elements.accountCooldownMessage) {
+      elements.accountCooldownMessage.textContent =
+        `平台要求暂时等待；可在 ${formatResumeTime(resumeAt)} 继续（还需 ${formatRemaining(resumeAt - now)}）。` +
+        "任务进度和已有结果都已保存在本机。";
+    }
+    const changed = state.accountCoolingDown !== waiting;
+    state.accountCoolingDown = waiting;
+    if (changed && state.auth) {
+      const connected = isAuthenticated(state.auth);
+      const collectionReady = state.health?.collector?.collection_runtime_ok === true;
+      elements.createJob.disabled = !(connected && collectionReady) || waiting;
+      setButtonLabel(
+        elements.createJob,
+        waiting
+          ? "等待平台允许后再开始"
+          : connected && collectionReady
+            ? "开始整理"
+            : connected
+              ? "整理功能未就绪"
+              : "请先完成登录",
+      );
+    }
+    return waiting;
   }
 
   async function loadHealth({ quiet = false } = {}) {
@@ -310,6 +444,7 @@
       };
       setServerAvailable(true);
       renderRuntimeMode();
+      refreshCooldownDisplays();
       return health;
     } catch (error) {
       setServerAvailable(false);
@@ -360,6 +495,7 @@
     const browserSupported = collector.browser_login_supported === true;
     const collectionReady = collector.collection_runtime_ok === true;
     const browserActive = BROWSER_LOGIN_ACTIVE.has(state.browserLogin?.status);
+    const accountCoolingDown = renderAccountCooldown();
     elements.authAction.disabled =
       !connected && (!(browserSupported || importSupported) || browserActive);
     elements.logout.hidden = false;
@@ -380,10 +516,12 @@
       elements.manualLogin.open = true;
       state.manualLoginAutoOpened = true;
     }
-    elements.createJob.disabled = !(connected && collectionReady);
+    elements.createJob.disabled = !(connected && collectionReady) || accountCoolingDown;
     setButtonLabel(
       elements.createJob,
-      connected
+      accountCoolingDown
+        ? "等待平台允许后再开始"
+        : connected
         ? collectionReady
           ? "开始整理"
           : "整理功能未就绪"
@@ -844,6 +982,7 @@
       await loadJobs();
       document.querySelector("#jobs-title")?.scrollIntoView({ behavior: "smooth", block: "start" });
     } catch (error) {
+      await refreshCooldownAfterMutationError(error);
       showFormError(humanError(error));
     } finally {
       renderAuth(state.auth);
@@ -868,6 +1007,127 @@
       minute: "2-digit",
       hour12: false,
     }).format(date);
+  }
+
+  function jobResumeAt(job) {
+    const deadlines = [job?.resume_not_before, job?.retry_after_at, job?.account_cooldown_until]
+      .map((raw) => Date.parse(String(raw || "")))
+      .filter(Number.isFinite);
+    const seconds = Number(job?.retry_after);
+    const updatedAt = Date.parse(String(job?.updated_at || ""));
+    if (Number.isFinite(seconds) && seconds > 0 && Number.isFinite(updatedAt)) {
+      deadlines.push(updatedAt + seconds * 1000);
+    }
+    return deadlines.length ? Math.max(...deadlines) : null;
+  }
+
+  function formatRemaining(milliseconds) {
+    const seconds = Math.max(0, Math.ceil(milliseconds / 1000));
+    const minutes = Math.floor(seconds / 60);
+    const remainder = String(seconds % 60).padStart(2, "0");
+    return minutes ? `${minutes}:${remainder}` : `${seconds} 秒`;
+  }
+
+  function formatResumeTime(timestamp) {
+    const target = new Date(timestamp);
+    const now = new Date();
+    const sameDay =
+      target.getFullYear() === now.getFullYear() &&
+      target.getMonth() === now.getMonth() &&
+      target.getDate() === now.getDate();
+    return new Intl.DateTimeFormat("zh-CN", {
+      ...(sameDay ? {} : { year: "numeric", month: "2-digit", day: "2-digit" }),
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(new Date(timestamp));
+  }
+
+  function pausedJobMessage(job, now = Date.now()) {
+    if (job.error_code === "REQUEST_BUDGET_EXHAUSTED") {
+      return "已达到本地安全请求上限。已有结果仍可下载，请缩小范围后创建新任务。";
+    }
+    if (job.status === "paused_auth") {
+      return job.error_code === "ACCOUNT_CHANGED"
+        ? "当前账号与创建任务时不同。请切换回原账号，再继续这个任务。"
+        : "登录状态已失效，进度已经保存。请重新登录后再继续。";
+    }
+    if (job.status === "paused_rate_limit") {
+      const resumeAt = jobResumeAt(job);
+      if (resumeAt && resumeAt > now) {
+        return `平台要求暂时等待，进度已经保存。可在 ${formatResumeTime(resumeAt)} 继续（还需 ${formatRemaining(resumeAt - now)}）。`;
+      }
+      return "平台要求暂时等待，进度已经保存。现在可以尝试继续。";
+    }
+    if (job.status === "paused_interrupted") {
+      const resumeAt = jobResumeAt(job);
+      if (resumeAt && resumeAt > now) {
+        return `服务或网络暂时不可用，进度已经保存。可在 ${formatResumeTime(resumeAt)} 继续（还需 ${formatRemaining(resumeAt - now)}）。`;
+      }
+      return "运行被中断，进度已经保存。确认本地服务和网络正常后，可从上次进度继续。";
+    }
+    if (job.status === "paused_cursor_invalid") {
+      return "下一页位置已经失效，旧任务无法安全继续。已有结果仍可下载，请按相同设置创建新任务。";
+    }
+    return "";
+  }
+
+  function transitionAnnouncement(job) {
+    if (job.status?.startsWith("paused_")) return `${jobTitle(job)}：${pausedJobMessage(job)}`;
+    if (job.status === "completed") return `${jobTitle(job)}已完成，可以下载结果。`;
+    if (job.status === "completed_with_warnings") return `${jobTitle(job)}已完成，部分信息未取到。`;
+    if (job.status === "failed") return `${jobTitle(job)}运行失败，请查看任务提示。`;
+    if (job.status === "cancelled") return `${jobTitle(job)}已取消，已有结果仍会保留。`;
+    return "";
+  }
+
+  function announceJobTransitions(jobs) {
+    const nextStatuses = new Map();
+    const messages = [];
+    let enteredRateLimit = false;
+    jobs.forEach((job) => {
+      const id = String(job.id);
+      const previous = state.jobStatuses.get(id);
+      nextStatuses.set(id, job.status);
+      const firstPausedSnapshot = !previous && job.status?.startsWith("paused_");
+      if (
+        (firstPausedSnapshot || (previous && previous !== job.status)) &&
+        ATTENTION_STATUSES.has(job.status)
+      ) {
+        if (job.status === "paused_rate_limit") enteredRateLimit = true;
+        const message = transitionAnnouncement(job);
+        if (message) messages.push(message);
+      }
+    });
+    state.jobStatuses = nextStatuses;
+    if (messages.length) showToast(messages.join(" "), messages.some((message) => message.includes("失败")));
+    return enteredRateLimit;
+  }
+
+  function refreshCooldownDisplays() {
+    const now = Date.now();
+    const accountCoolingDown = renderAccountCooldown(now);
+    let hasFutureCooldown = accountCoolingDown;
+    document.querySelectorAll('[data-job-action="resume"]').forEach((button) => {
+      const resumeAt = Number(button.dataset.resumeAt);
+      const waiting = accountCoolingDown || (Number.isFinite(resumeAt) && resumeAt > now);
+      hasFutureCooldown ||= waiting;
+      button.disabled = waiting;
+      const effectiveResumeAt = Math.max(resumeAt || 0, accountCooldownAt() || 0);
+      setButtonLabel(
+        button,
+        waiting ? `等待 ${formatRemaining(effectiveResumeAt - now)}` : "继续任务",
+      );
+    });
+    document.querySelectorAll("[data-cooldown-job-id]").forEach((node) => {
+      const job = state.jobs.find((item) => String(item.id) === node.dataset.cooldownJobId);
+      if (job) node.textContent = pausedJobMessage(job, now);
+    });
+    window.clearTimeout(state.cooldownTimer);
+    if (hasFutureCooldown && !document.hidden) {
+      state.cooldownTimer = window.setTimeout(refreshCooldownDisplays, 1000);
+    }
   }
 
   function jobTitle(job) {
@@ -959,7 +1219,13 @@
   }
 
   function actionButton(label, action, jobId, variant = "secondary") {
-    const icons = { confirm: "download", cancel: "close", resume: "play", retry: "refresh" };
+    const icons = {
+      confirm: "download",
+      cancel: "close",
+      login: "browser",
+      resume: "play",
+      retry: "refresh",
+    };
     const button = element("button", `button button-${variant} button-small`);
     button.type = "button";
     button.dataset.jobAction = action;
@@ -1008,6 +1274,11 @@
     current.className = next.className;
     current.dataset.jobId = next.dataset.jobId || "";
     if (next.dataset.jobAction) current.dataset.jobAction = next.dataset.jobAction;
+    if (next.dataset.resumeAt) current.dataset.resumeAt = next.dataset.resumeAt;
+    else delete current.dataset.resumeAt;
+    if (current instanceof HTMLButtonElement && next instanceof HTMLButtonElement) {
+      current.disabled = next.disabled;
+    }
     if (next.dataset.exportDownload) {
       current.dataset.exportDownload = next.dataset.exportDownload;
     }
@@ -1078,7 +1349,11 @@
 
     card.append(topline, meta, progress, element("p", "job-detail", jobProgressText(job)));
 
-    if (job.error_message || job.error_code) {
+    if (job.status?.startsWith("paused_")) {
+      const guidance = element("p", "job-pause-guidance", pausedJobMessage(job));
+      guidance.dataset.cooldownJobId = String(job.id);
+      card.append(guidance);
+    } else if (job.error_message || job.error_code) {
       const errorText = [job.error_code, job.error_message].filter(Boolean).join("：");
       card.append(element("p", "job-error", errorText));
     }
@@ -1090,10 +1365,24 @@
     if (ACTIVE_STATUSES.has(job.status) || job.status === "awaiting_detail_confirmation") {
       actions.append(actionButton("取消", "cancel", job.id, "secondary"));
     }
-    if (PAUSED_STATUSES.has(job.status)) {
-      actions.append(actionButton("恢复", "resume", job.id, "secondary"));
+    if (PAUSED_STATUSES.has(job.status) && job.error_code !== "REQUEST_BUDGET_EXHAUSTED") {
+      if (job.status === "paused_auth") {
+        actions.append(actionButton("重新登录", "login", job.id, "primary"));
+      }
+      const label = job.status === "paused_auth" ? "已重新登录，继续任务" : "继续任务";
+      const resume = actionButton(label, "resume", job.id, "secondary");
+      const resumeAt = jobResumeAt(job);
+      if (resumeAt) {
+        resume.dataset.resumeAt = String(resumeAt);
+        resume.disabled = resumeAt > Date.now();
+      }
+      actions.append(resume);
     }
-    if (job.enumeration_complete === true && Number(job.detail_failed || 0) > 0) {
+    if (
+      job.error_code !== "REQUEST_BUDGET_EXHAUSTED" &&
+      job.enumeration_complete === true &&
+      Number(job.detail_failed || 0) > 0
+    ) {
       actions.append(actionButton("重试失败项", "retry", job.id, "secondary"));
     }
     const artifacts = job.artifacts && typeof job.artifacts === "object" ? job.artifacts : {};
@@ -1156,7 +1445,11 @@
     });
     elements.jobsEmpty.hidden = state.jobs.length > 0;
     elements.jobsList.hidden = state.jobs.length === 0;
+    document.title = state.jobs.some((job) => job.status?.startsWith("paused_"))
+      ? `[需处理] ${BASE_DOCUMENT_TITLE}`
+      : BASE_DOCUMENT_TITLE;
     renderWorkflowState();
+    refreshCooldownDisplays();
   }
 
   function scheduleJobsRefresh() {
@@ -1173,7 +1466,18 @@
     try {
       const payload = await api("/jobs?limit=100");
       setServerAvailable(true);
-      state.jobs = normalizeJobs(payload);
+      const jobs = normalizeJobs(payload);
+      const enteredRateLimit = announceJobTransitions(jobs);
+      state.jobs = jobs;
+      const hasAdvertisedAccountCooldown = jobs.some((job) => {
+        const timestamp = Date.parse(String(job.account_cooldown_until || ""));
+        return Number.isFinite(timestamp) && timestamp > Date.now();
+      });
+      if (enteredRateLimit || hasAdvertisedAccountCooldown) {
+        // A job may belong to an older account, so only /health decides whether
+        // the currently connected account is cooling down.
+        await loadHealth({ quiet: true });
+      }
       renderJobs();
     } catch (error) {
       setServerAvailable(false);
@@ -1220,6 +1524,7 @@
       state.confirmJob = null;
       await loadJobs();
     } catch (error) {
+      await refreshCooldownAfterMutationError(error);
       showToast(humanError(error), true);
     } finally {
       elements.confirmDetails.disabled = false;
@@ -1249,6 +1554,15 @@
       openDetailConfirmation(job);
       return;
     }
+    if (action === "login") {
+      document.querySelector("#auth-title")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (isAuthenticated(state.auth)) {
+        showToast("请先退出当前登录态，再重新打开网页登录；任务进度不会丢失。", false);
+      } else {
+        elements.authAction.click();
+      }
+      return;
+    }
     if (action === "cancel" && !window.confirm("确定取消这个任务吗？已整理的数据不会被删除。")) {
       return;
     }
@@ -1260,8 +1574,10 @@
       showToast(labels[action] || "任务已更新。", false);
       await loadJobs();
     } catch (error) {
+      const refreshedCooldown = await refreshCooldownAfterMutationError(error);
       showToast(humanError(error), true);
       button.disabled = false;
+      if (refreshedCooldown) refreshCooldownDisplays();
     }
   }
 
@@ -1328,6 +1644,7 @@
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
         window.clearTimeout(state.jobsTimer);
+        window.clearTimeout(state.cooldownTimer);
       } else {
         loadJobs({ quiet: true });
         loadBrowserLoginStatus({ quiet: true });
@@ -1335,6 +1652,7 @@
     });
     window.addEventListener("beforeunload", () => {
       window.clearTimeout(state.jobsTimer);
+      window.clearTimeout(state.cooldownTimer);
       window.clearTimeout(state.browserLoginTimer);
       elements.cookieInput.value = "";
     });

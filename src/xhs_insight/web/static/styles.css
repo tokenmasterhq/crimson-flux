@@ -532,6 +532,42 @@ code {
   box-shadow: var(--shadow-panel);
 }
 
+.account-cooldown-banner {
+  display: flex;
+  gap: 13px;
+  align-items: flex-start;
+  margin: 0 0 18px;
+  padding: 15px 17px;
+  border-radius: 16px;
+  background: var(--accent-faint);
+  box-shadow: inset 3px 0 0 var(--accent), 0 8px 24px -22px rgb(161 18 43 / 45%);
+  color: var(--ink);
+}
+
+.account-cooldown-banner[hidden] {
+  display: none;
+}
+
+.account-cooldown-banner > .icon {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: var(--accent);
+}
+
+.account-cooldown-banner strong {
+  font-size: 13px;
+}
+
+.account-cooldown-banner p {
+  margin: 4px 0 0;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.55;
+}
+
 .panel-heading {
   display: flex;
   gap: 24px;
@@ -2293,6 +2329,18 @@ input[type="number"],
   color: var(--danger);
   font-size: 11px;
   line-height: 1.5;
+}
+
+.job-pause-guidance {
+  margin: 11px 0 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--warning-soft);
+  box-shadow: inset 3px 0 0 var(--accent);
+  color: var(--ink);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.55;
 }
 
 .job-actions {
