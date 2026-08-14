@@ -153,8 +153,14 @@ def _fail(error: Exception | str, *, code: int = 1) -> NoReturn:
                 remaining = max(
                     1, math.ceil((retry_at - datetime.now(UTC)).total_seconds())
                 )
-                local_retry = retry_at.astimezone()
                 local_now = datetime.now().astimezone()
+                try:
+                    local_retry = retry_at.astimezone()
+                except (OSError, OverflowError):
+                    # Windows' CRT rejects timestamps near datetime.max.
+                    # A fixed local offset preserves a useful bounded display
+                    # without asking the operating system to convert that date.
+                    local_retry = retry_at.astimezone(local_now.tzinfo)
                 label = local_retry.strftime(
                     "%H:%M:%S"
                     if local_retry.date() == local_now.date()

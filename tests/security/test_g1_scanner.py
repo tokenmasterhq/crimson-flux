@@ -255,6 +255,12 @@ def test_browser_login_g1_contract_requires_isolation_scope_verification_and_cle
     detail = _browser_login_check(tmp_path)["detail"]
     assert all(detail.values()), detail
 
+    for path in (browser, adapter, app):
+        normalized = path.read_bytes().replace(b"\r\n", b"\n")
+        path.write_bytes(normalized.replace(b"\n", b"\r\n"))
+    crlf_detail = _browser_login_check(tmp_path)["detail"]
+    assert all(crlf_detail.values()), crlf_detail
+
     browser_source = browser.read_text(encoding="utf-8")
     app_source = app.read_text(encoding="utf-8")
 

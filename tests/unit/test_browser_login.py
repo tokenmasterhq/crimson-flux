@@ -1155,7 +1155,11 @@ def test_profile_cleanup_does_not_reapply_marker_acl(
     assert _remove_profile_root(root) is True
 
 
-def test_profile_root_uses_system_temp_not_state_dir_and_preserves_host_env(
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows uses the separately tested Known Folder and DACL path",
+)
+def test_posix_profile_root_uses_system_temp_not_state_dir_and_preserves_host_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

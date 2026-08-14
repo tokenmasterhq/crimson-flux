@@ -183,6 +183,7 @@ def test_cli_rate_limit_deadline_saturates_without_traceback(
     assert result.exit_code == 1, result.output
     assert "本地时间 999" in result.output
     assert "OverflowError" not in result.output
+    assert not isinstance(result.exception, OSError)
 
 
 def test_cli_budget_exhaustion_does_not_offer_or_post_resume(

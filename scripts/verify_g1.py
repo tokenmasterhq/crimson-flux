@@ -124,9 +124,12 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
             "passed": False,
             "detail": "browser login or adapter module missing",
         }
-    browser = browser_path.read_bytes()
-    adapter = adapter_path.read_bytes()
-    app = app_path.read_bytes()
+    # Git for Windows may materialize tracked text files with CRLF endings.
+    # Contract checks describe source semantics, so normalize line endings
+    # before matching multi-line markers.
+    browser = browser_path.read_bytes().replace(b"\r\n", b"\n")
+    adapter = adapter_path.read_bytes().replace(b"\r\n", b"\n")
+    app = app_path.read_bytes().replace(b"\r\n", b"\n")
     lowered = browser.lower()
     login_url = b'https://www.xiaohongshu.com/explore'
     cookie_source = b'https://edith.xiaohongshu.com/api/sns/web/v2/user/me'
