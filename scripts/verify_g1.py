@@ -222,6 +222,9 @@ def _browser_login_check(root: Path) -> dict[str, Any]:
             and b"def _validate_profile(" in browser
             and b"def _directory_lstat(" in browser
             and b"def _regular_lstat(" in browser
+            and b"def _same_open_file_state(" in browser
+            and b"st_birthtime_ns" in browser
+            and b"_same_open_file_state(opened, expected)" in browser
             and b".lstat()" in browser
             and b"stat.S_ISLNK(" in browser
             and b"_FILE_ATTRIBUTE_REPARSE_POINT" in browser

@@ -9,11 +9,13 @@ import json
 import os
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -35,8 +37,10 @@ from xhs_insight.browser_login import (
     _create_owned_profile_root_at,
     _IsolatedBrowserSession,
     _LoginSession,
+    _read_owned_marker,
     _remove_profile,
     _remove_profile_root,
+    _same_open_file_state,
     _terminate_browser_process,
     _validate_cdp_request,
     _windows_known_folder_path,
@@ -1155,6 +1159,75 @@ def test_profile_cleanup_does_not_reapply_marker_acl(
     assert _remove_profile_root(root) is True
 
 
+def _windows_stat_view(**changes: int) -> SimpleNamespace:
+    values = {
+        "st_mode": stat.S_IFREG | 0o666,
+        "st_ino": 123456,
+        "st_dev": 654321,
+        "st_size": 99,
+        "st_mtime_ns": 1_234_567_800,
+        "st_ctime_ns": 1_234_567_900,
+        "st_birthtime_ns": 1_234_567_000,
+        "st_file_attributes": 0,
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+def test_windows_open_marker_comparison_uses_birthtime_not_ctime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _windows_stat_view()
+    opened = _windows_stat_view(st_ctime_ns=expected.st_ctime_ns + 100)
+    monkeypatch.setattr("xhs_insight.browser_login._windows_runtime", lambda: True)
+
+    assert _same_open_file_state(opened, expected) is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("st_dev", 1),
+        ("st_ino", 1),
+        ("st_mode", stat.S_IFREG | 0o444),
+        ("st_size", 98),
+        ("st_mtime_ns", 1),
+        ("st_birthtime_ns", 1),
+    ],
+)
+def test_windows_open_marker_comparison_rejects_identity_or_content_drift(
+    field: str,
+    value: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = _windows_stat_view()
+    opened = _windows_stat_view(**{field: value})
+    monkeypatch.setattr("xhs_insight.browser_login._windows_runtime", lambda: True)
+
+    assert _same_open_file_state(opened, expected) is False
+
+
+def test_windows_marker_read_accepts_descriptor_ctime_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / ".owner"
+    payload = b"owned-marker"
+    marker.write_bytes(payload)
+    expected = _windows_stat_view(st_size=len(payload))
+    opened = _windows_stat_view(
+        st_size=len(payload),
+        st_ctime_ns=expected.st_ctime_ns + 100,
+    )
+    monkeypatch.setattr("xhs_insight.browser_login._windows_runtime", lambda: True)
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._regular_lstat", lambda _path: expected
+    )
+    monkeypatch.setattr("xhs_insight.browser_login.os.fstat", lambda _fd: opened)
+
+    assert _read_owned_marker(marker, expected) == payload
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="Windows uses the separately tested Known Folder and DACL path",
@@ -1370,6 +1443,9 @@ def test_windows_root_and_each_profile_apply_and_revalidate_private_dacl(
     validated: list[Path] = []
     monkeypatch.setattr("xhs_insight.browser_login._windows_runtime", lambda: True)
     monkeypatch.setattr(
+        "xhs_insight.browser_login._same_open_file_state", os.path.samestat
+    )
+    monkeypatch.setattr(
         "xhs_insight.browser_login._windows_current_user_sid", lambda: sid
     )
     monkeypatch.setattr(
@@ -1427,6 +1503,9 @@ def test_windows_profile_dacl_failure_leaves_no_registered_profile(
     sid = "S-1-5-21-100-200-300-400"
     fail_profiles = {"enabled": False}
     monkeypatch.setattr("xhs_insight.browser_login._windows_runtime", lambda: True)
+    monkeypatch.setattr(
+        "xhs_insight.browser_login._same_open_file_state", os.path.samestat
+    )
     monkeypatch.setattr(
         "xhs_insight.browser_login._windows_current_user_sid", lambda: sid
     )

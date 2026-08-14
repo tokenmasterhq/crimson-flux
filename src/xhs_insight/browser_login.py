@@ -1267,6 +1267,32 @@ def _same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
     )
 
 
+def _same_open_file_state(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare a descriptor stat with its path snapshot across platforms."""
+
+    if not _windows_runtime():
+        return _same_file_state(left, right)
+    left_birthtime = getattr(left, "st_birthtime_ns", None)
+    right_birthtime = getattr(right, "st_birthtime_ns", None)
+    return (
+        type(left_birthtime) is int
+        and type(right_birthtime) is int
+        and os.path.samestat(left, right)
+        and (
+            left.st_mode,
+            left.st_size,
+            left.st_mtime_ns,
+            left_birthtime,
+        )
+        == (
+            right.st_mode,
+            right.st_size,
+            right.st_mtime_ns,
+            right_birthtime,
+        )
+    )
+
+
 def _read_owned_marker(path: Path, expected: os.stat_result) -> bytes:
     """Read an already-hardened ownership marker without reapplying its ACL."""
 
@@ -1282,7 +1308,7 @@ def _read_owned_marker(path: Path, expected: os.stat_result) -> bytes:
         if (
             not stat.S_ISREG(opened.st_mode)
             or _has_reparse_attribute(opened)
-            or not _same_file_state(opened, expected)
+            or not _same_open_file_state(opened, expected)
         ):
             raise RuntimeError("临时浏览器标记读取校验失败")
         payload = bytearray()
